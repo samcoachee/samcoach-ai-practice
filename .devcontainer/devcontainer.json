@@ -33,6 +33,8 @@
         "workbench.panel.defaultLocation": "bottom",
         "editor.minimap.enabled": false,
         "editor.wordWrap": "on",
+        "editor.unicodeHighlight.nonBasicASCII": false,
+        "editor.unicodeHighlight.ambiguousCharacters": false,
         "files.autoSave": "off",
         "terminal.integrated.defaultLocation": "view",
         "terminal.integrated.fontSize": 14,
