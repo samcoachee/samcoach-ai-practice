@@ -11,6 +11,7 @@ import {
   DIFF_MAX_BYTES,
   PROMPT_MAX_CHARS,
   clip,
+  isSecretFile,
   redactSecrets,
   safeJoin,
   stripAnsi,
@@ -119,7 +120,26 @@ async function git(args, cwd, opts = {}) {
   return r;
 }
 
-const DEFAULT_GITIGNORE = ['node_modules/', '.venv/', '__pycache__/', '*.pyc', '.DS_Store', ''].join('\n');
+const DEFAULT_GITIGNORE = ['node_modules/', '.venv/', '__pycache__/', '*.pyc', '.DS_Store', '.env', '.env.*', '*.pem', ''].join('\n');
+
+// 변경 내용에서 뺄 파일 — 비밀이 들기 쉬운 것과, 크기만 크고 채점에 쓰지 않는 잠금 파일(앞에서 잘리면 src 변경이 빠진다)
+// 비밀 파일은 util.mjs isSecretFile 과 같은 이름을 뺀다(10/25 시스템 검토 — 파일 목록은 빼고 변경 내용에는 남던 이름이 있었다)
+const DIFF_EXCLUDES = [
+  ':(glob,exclude)**/.env',
+  ':(glob,exclude)**/.env.*',
+  ':(glob,exclude)**/*.pem',
+  ':(glob,exclude)**/*.key',
+  ':(glob,exclude)**/*.p12',
+  ':(glob,exclude)**/*.pfx',
+  ':(glob,exclude)**/id_rsa*',
+  ':(glob,exclude)**/id_ed25519*',
+  ':(glob,exclude)**/id_ecdsa*',
+  ':(glob,exclude)**/id_dsa*',
+  ':(glob,exclude)**/.npmrc',
+  ':(glob,exclude)**/.netrc',
+  ':(glob,exclude)**/package-lock.json',
+  ':(glob,exclude)**/node_modules/**',
+];
 
 /** assignment/ 에 git 을 만들고 첫 커밋(기준점)을 남긴다. 기준점 커밋 해시를 돌려준다 */
 export async function initRepo(dir) {
@@ -165,7 +185,7 @@ export async function getCommits(dir, base) {
 /** 기준점 대비 작업 폴더 전체의 diff(새 파일 포함). 앞 200KB 까지 */
 export async function getDiff(dir, base) {
   await git(['add', '-A', '-N'], dir); // 새 파일도 diff 에 나오게 한다(내용은 담지 않는다)
-  const r = await git(['diff', '--no-color', '--no-ext-diff', base], dir, { maxBytes: DIFF_MAX_BYTES + 1, killOnLimit: true, timeoutMs: 60_000 });
+  const r = await git(['diff', '--no-color', '--no-ext-diff', base, '--', '.', ...DIFF_EXCLUDES], dir, { maxBytes: DIFF_MAX_BYTES + 1, killOnLimit: true, timeoutMs: 60_000 });
   const buf = Buffer.from(r.stdout, 'utf8');
   const truncated = r.truncated || buf.length > DIFF_MAX_BYTES;
   let diff = buf.length > DIFF_MAX_BYTES ? buf.subarray(0, DIFF_MAX_BYTES).toString('utf8') : r.stdout;
@@ -298,7 +318,7 @@ export function listFiles(dir, max = 3000) {
       const r = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) {
         if (!SKIP_DIRS.has(e.name)) walk(path.join(d, e.name), r);
-      } else if (e.isFile()) {
+      } else if (e.isFile() && !isSecretFile(r)) {
         try {
           out.push({ path: r, bytes: fs.statSync(path.join(d, e.name)).size });
         } catch {
@@ -409,86 +429,84 @@ export function readMcp({ assignmentDir, workspaceDir, ...homeOpts }) {
   return parts.length ? clip(parts.join('\n\n'), 6000) : null;
 }
 
-/** 셸 기록 마지막 200줄. 비밀 값은 가린다 */
-export function readShellHistory({ env = process.env, home = os.homedir() } = {}) {
+function historyFiles({ env = process.env, home = os.homedir() } = {}) {
   const cands = [];
   if (env.HISTFILE) cands.push(env.HISTFILE);
   cands.push(path.join(home, '.bash_history'), path.join(home, '.zsh_history'));
   if (env.APPDATA) cands.push(path.join(env.APPDATA, 'Microsoft', 'Windows', 'PowerShell', 'PSReadLine', 'ConsoleHost_history.txt'));
-  for (const f of cands) {
+  return cands;
+}
+
+/** 시작할 때 셸 기록이 몇 줄이었는지 — 그 뒤에 친 줄만 이번 응시의 기록으로 보낸다 */
+export function shellHistoryMark(opts = {}) {
+  for (const f of historyFiles(opts)) {
+    try {
+      return { file: f, lines: fs.readFileSync(f, 'utf8').split(/\r?\n/).length };
+    } catch {
+      // 없는 파일
+    }
+  }
+  return null;
+}
+
+/**
+ * 셸 기록 마지막 200줄. 비밀 값은 가린다.
+ * mark 가 있으면 시작한 뒤에 친 줄만(앞 과제의 npm test 가 이번 응시의 「테스트를 돌림」으로 섞이지 않게 — 10/25 검토).
+ */
+export function readShellHistory({ env = process.env, home = os.homedir(), mark = null } = {}) {
+  for (const f of historyFiles({ env, home })) {
     let text;
     try {
       text = fs.readFileSync(f, 'utf8');
     } catch {
       continue;
     }
-    const lines = text
-      .split(/\r?\n/)
+    let raw = text.split(/\r?\n/);
+    if (mark && mark.file === f && Number.isInteger(mark.lines) && mark.lines > 0 && mark.lines <= raw.length) raw = raw.slice(mark.lines - 1);
+    const lines = raw
       .map((l) => l.replace(/^: \d+:\d+;/, '').trim())
       .filter((l) => l && !l.startsWith('#'))
       .slice(-200)
       .map((l) => clip(redactSecrets(l), 500));
-    if (lines.length) return lines;
+    if (lines.length || mark) return lines;
   }
   return [];
 }
 
-/* ───────────────────────── 묶음 ───────────────────────── */
-
-/** assignment/ 를 tar.gz 로 묶는다(node_modules · .git 제외, 목록 파일 방식이라 tar 종류와 무관) */
-export async function createBundle({ workspaceDir, assignmentDir, outFile }) {
-  const base = path.basename(assignmentDir);
-  const names = listFiles(assignmentDir, 20000).map((f) => `${base}/${f.path}`);
-  const listFile = `${outFile}.list`;
-  fs.writeFileSync(listFile, (names.length ? names : [base]).join('\n') + '\n', 'utf8');
-  try {
-    const args = ['-czf', outFile, '-C', path.dirname(assignmentDir), '-T', listFile];
-    let r = await runCapture('tar', args, { cwd: workspaceDir, timeoutMs: 120_000 });
-    // GNU tar 는 「C:\...」 의 앞 글자를 서버 이름으로 읽는다(윈도의 Git Bash). 그때만 로컬 파일로 읽게 한다
-    if (r.code !== 0 && /Cannot connect to|resolve failed/i.test(r.stderr)) {
-      r = await runCapture('tar', ['--force-local', ...args], { cwd: workspaceDir, timeoutMs: 120_000 });
-    }
-    if (r.code !== 0) throw new PracticeError(`작업 폴더를 묶지 못했습니다. ${tail(r.stderr, 200)}`);
-  } finally {
-    try {
-      fs.unlinkSync(listFile);
-    } catch {
-      // 임시 파일
-    }
-  }
-  return fs.statSync(outFile).size;
-}
-
 /* ───────────────────────── 조립 ───────────────────────── */
+// 작업 폴더 묶음(tar)은 1.1 부터 만들지 않는다 — 확인 문제와 채점은 이 manifest 만 읽는다(서버 cli/submit/init 410)
 
 /** SubmitManifest 로 맞춘다(순수). 길이 · 개수 상한을 여기서 건다 */
 export function assembleManifest(parts) {
   const diffBuf = Buffer.from(parts.diff || '', 'utf8');
   const diffTooLong = diffBuf.length > DIFF_MAX_BYTES;
   const diff = diffTooLong ? diffBuf.subarray(0, DIFF_MAX_BYTES).toString('utf8').replace(/�+$/, '') : parts.diff || '';
+  // 비밀 값은 보내기 전에 가린다 — 변경 내용 · 지시 글 · 결과물 · 테스트 출력까지(10/25 검토). 서버도 한 번 더 가린다
   const prompts = [...(parts.prompts || [])]
     .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
     .slice(0, 500)
-    .map((p) => ({ at: p.at, tool: p.tool, text: clip(p.text, PROMPT_MAX_CHARS) }));
+    .map((p) => ({ at: p.at, tool: p.tool, text: redactSecrets(clip(p.text, PROMPT_MAX_CHARS)) }));
+  const deliverables = {};
+  for (const [k, v] of Object.entries(parts.deliverables || {})) deliverables[k] = redactSecrets(v);
   return {
     cliVersion: parts.cliVersion || CLI_VERSION,
-    commits: (parts.commits || []).slice(0, 500),
-    diff,
+    commits: (parts.commits || []).slice(0, 500).map((c) => ({ ...c, message: redactSecrets(c.message) })),
+    diff: redactSecrets(diff),
     diffTruncated: Boolean(parts.diffTruncated) || diffTooLong,
     tests: (parts.tests || []).slice(0, 1000).map((t) => {
       const row = { name: clip(t.name, 300), passed: Boolean(t.passed), hidden: Boolean(t.hidden) };
-      if (t.message) row.message = clip(t.message, 300);
+      if (t.message) row.message = redactSecrets(clip(t.message, 300));
       return row;
     }),
-    testOutputTail: tail(parts.testOutputTail || '', 6000),
+    testOutputTail: redactSecrets(tail(parts.testOutputTail || '', 6000)),
     files: (parts.files || []).slice(0, 3000),
-    deliverables: parts.deliverables || {},
+    deliverables,
     prompts,
     usage: parts.usage || [],
     skills: (parts.skills || []).slice(0, 200),
     mcp: parts.mcp ?? null,
     shellHistory: (parts.shellHistory || []).slice(-200),
-    bundleKey: parts.bundleKey ?? null,
-    bundleBytes: parts.bundleBytes || 0,
+    bundleKey: null,
+    bundleBytes: 0,
   };
 }

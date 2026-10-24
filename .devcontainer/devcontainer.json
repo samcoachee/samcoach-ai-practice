@@ -15,6 +15,8 @@
   },
   // practice CLI 와 Codex 를 설치하고, 셸 기록이 바로 파일에 남게 한다
   "postCreateCommand": "bash .devcontainer/post-create.sh",
+  // 작업 공간이 멈췄다 다시 켜지면 뒤에서 도는 지켜보는 프로그램이 사라진다. 켜질 때마다 status 를 한 번 불러 다시 켠다(시작 전이면 아무 일도 안 한다)
+  "postStartCommand": "timeout 25 practice status >/dev/null 2>&1 || true",
   "forwardPorts": [3000, 5173, 8000, 8080],
   "portsAttributes": {
     "3000": { "label": "미리보기 3000", "onAutoForward": "notify" },
@@ -37,6 +39,10 @@
         "editor.unicodeHighlight.ambiguousCharacters": false,
         "files.autoSave": "off",
         "terminal.integrated.defaultLocation": "view",
+        // 과제 파일은 모두 assignment 폴더에 풀린다. 터미널이 저장소 맨 위에서 열리면 npm 이 package.json 을 못 찾고 결과물이 제출 폴더 밖에 생긴다
+        "terminal.integrated.cwd": "${workspaceFolder}/assignment",
+        // assignment 는 .gitignore 에 들어 있어 기본 설정으로는 검색에서 빠진다. 사전 체험의 돋보기 검색이 비지 않게 한다
+        "search.useIgnoreFiles": false,
         "terminal.integrated.fontSize": 14,
         "explorer.confirmDelete": false,
         "telemetry.telemetryLevel": "off"

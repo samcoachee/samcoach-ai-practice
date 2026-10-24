@@ -14,10 +14,9 @@ import {
   updateConfig,
   writeConfig,
 } from './config.mjs';
-import { PracticeError, putBundle, request } from './http.mjs';
+import { PracticeError, request } from './http.mjs';
 import {
   assembleManifest,
-  createBundle,
   getCommits,
   getDiff,
   initRepo,
@@ -27,11 +26,23 @@ import {
   readShellHistory,
   readSkills,
   runTests,
+  shellHistoryMark,
 } from './manifest.mjs';
 import { collectSessions } from './sessions.mjs';
-import { BUNDLE_MAX_BYTES, CLI_VERSION, HEARTBEAT_MS, fmtDuration, fmtTokens, safeJoin, sleep } from './util.mjs';
+import { CLI_VERSION, HEARTBEAT_MS, fmtDuration, fmtTokens, safeJoin, sleep } from './util.mjs';
 
 const TERMINAL_STATUS = new Set(['submitted', 'verifying', 'graded', 'expired']);
+
+/** status 가 보여 주는 한국어 상태 이름. 서버 상태값(영어)을 그대로 찍지 않는다 */
+const STATUS_TEXT = {
+  created: '시작 전',
+  started: '진행 중',
+  submitting: '제출을 올리는 중',
+  submitted: '제출 완료',
+  verifying: '확인 문제 진행 중',
+  graded: '채점 끝',
+  expired: '시간이 끝나 마감됨',
+};
 
 /** 명령이 쓰는 바깥 세계를 한 묶음으로. 시험에서는 일부를 바꿔 끼운다 */
 export function makeContext(overrides = {}) {
@@ -88,14 +99,48 @@ function isAlive(pid) {
   }
 }
 
-export function watchPid(ctx) {
+/**
+ * 그 프로그램이 켜진 시각(리눅스의 /proc/<번호>/stat 22번째 값). 읽을 수 없는 곳(윈도 · 맥)은 null.
+ * 작업 공간이 멈췄다 켜지면 옛 번호를 전혀 다른 프로그램이 쓸 수 있다. 번호만 보면 그 프로그램을 우리 것으로 착각하고
+ * 지켜보는 프로그램을 새로 켜지 않아 마감 자동 제출이 안 일어난다(10/25 검토). 번호와 시작 시각을 함께 적어 두고 둘 다 맞아야 산 것으로 본다.
+ */
+function startTicks(pid) {
   try {
-    const pid = Number(fs.readFileSync(pidPath(homeOpts(ctx)), 'utf8').trim());
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && isAlive(pid)) return pid;
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return rest[19] || null;
   } catch {
-    // 파일이 없다
+    return null;
   }
-  return null;
+}
+
+/** pid 파일 · 제출 잠금에 적는 글. 「번호」 또는 「번호:시작 시각」 */
+function pidRecord(pid) {
+  const t = startTicks(pid);
+  return t ? `${pid}:${t}` : String(pid);
+}
+
+function readPidRecord(file) {
+  try {
+    const [p, t] = fs.readFileSync(file, 'utf8').trim().split(':');
+    const pid = Number(p);
+    return Number.isInteger(pid) && pid > 0 ? { pid, ticks: t || null } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 적어 둔 프로그램이 지금도 그 프로그램인지 */
+function recordAlive(rec) {
+  if (!rec || !isAlive(rec.pid)) return false;
+  if (!rec.ticks) return true;
+  const now = startTicks(rec.pid);
+  return now === null || now === rec.ticks;
+}
+
+export function watchPid(ctx) {
+  const rec = readPidRecord(pidPath(homeOpts(ctx)));
+  return rec && rec.pid !== process.pid && recordAlive(rec) ? rec.pid : null;
 }
 
 function defaultSpawnWatch(ctx) {
@@ -119,7 +164,7 @@ function ensureWatch(ctx) {
     const newPid = ctx.spawnWatch(ctx);
     return { started: true, pid: newPid ?? null };
   } catch (e) {
-    ctx.warn(`  뒤에서 도는 확인 프로그램을 켜지 못했습니다. 터미널을 하나 더 열어 practice watch 를 직접 실행해 주세요. (${e && e.message ? e.message : e})`);
+    ctx.warn(`  지켜보는 프로그램(practice watch)을 뒤에서 켜지 못했습니다. 터미널을 하나 더 열어 practice watch 를 직접 실행해 주세요. (${e && e.message ? e.message : e})`);
     return { started: false, pid: null };
   }
 }
@@ -154,8 +199,16 @@ export async function login(ctx, args = []) {
   const title = data.task && data.task.title ? data.task.title : '과제';
   const minutes = data.task && data.task.minutes ? ` (${data.task.minutes}분)` : '';
   ctx.log(`연결됐습니다. 과제: ${title}${minutes}`);
-  if (cfg.startedAt && !TERMINAL_STATUS.has(String(cfg.status))) ctx.log('이미 시작한 과제입니다. 상태는 practice status 로 볼 수 있습니다.');
-  else ctx.log('준비가 됐으면 practice start 를 실행하세요. 이 명령을 실행하는 순간부터 시간이 흐릅니다.');
+  if (TERMINAL_STATUS.has(String(data.status))) {
+    // 끝난 과제에 start 안내를 하면 시계를 다시 켤 수 있는 것처럼 읽힌다
+    ctx.log('이미 제출한 과제입니다. 연습실 창으로 돌아가 확인 문제를 푸세요.');
+  } else if (cfg.startedAt) {
+    ctx.log('이미 시작한 과제입니다. 상태는 practice status 로 볼 수 있습니다.');
+    // 새 코드로 다시 로그인한 경우 - 옛 코드로 돌던 지켜보는 프로그램이 이미 멈췄을 수 있으니 켜져 있는지 본다
+    if (ensureWatch(ctx).started) ctx.log('  지켜보는 프로그램(practice watch)을 다시 켰습니다.');
+  } else {
+    ctx.log('준비가 됐으면 practice start 를 실행하세요. 이 명령을 실행하는 순간부터 시간이 흐릅니다.');
+  }
   return cfg;
 }
 
@@ -169,9 +222,10 @@ export async function start(ctx, args = []) {
   const workspace = resolveWorkspace(ctx, cfg);
   const dir = assignmentOf(workspace);
   fs.mkdirSync(dir, { recursive: true });
+  cleanupHidden(ctx);
 
-  // 1) 과제 파일 받기 + git 기준점 (이미 했으면 건너뛴다)
-  if (!cfg.baseline) {
+  // 1) 앞 과제 폴더 정리 — 시계를 켜기 전에 한다(여기서 막혀도 시간이 흐르지 않게)
+  if (!cfg.startedAt && !cfg.baseline) {
     const leftover = fs.readdirSync(dir).filter((n) => n !== '.gitkeep');
     // 같은 작업 공간에서 다음 과제를 하면 앞 과제 폴더가 남아 있다. practice 가 만든 폴더(.git 이 있다)면 지우지 않고 옮겨 둔다
     if (leftover.length > 0 && (force || leftover.includes('.git'))) {
@@ -182,10 +236,24 @@ export async function start(ctx, args = []) {
         'assignment 폴더가 비어 있지 않습니다. 이전에 받은 파일이면 practice start --force 로 다시 받습니다(있던 파일은 ~/.practice/archive 로 옮겨 둡니다).',
       );
     }
-    ctx.log('과제 파일을 받는 중...');
+  }
+
+  // 2) 시계 시작 — 과제 파일은 시계를 켠 뒤에만 받을 수 있다(서버가 막는다. 환불 기준 「내려받아 시간이 시작된 때」와 맞추려고)
+  if (!cfg.startedAt) {
+    const s = await request(ctx, cfg, 'POST', '/cli/start', {});
+    // 셸 기록이 지금 몇 줄인지 적어 두고, 제출 때는 그 뒤에 친 줄만 보낸다
+    cfg = updateConfig({ startedAt: s.startedAt, deadlineAt: s.deadlineAt, status: 'started', histMark: shellHistoryMark(homeOpts(ctx)) }, homeOpts(ctx));
+    ctx.log('시간이 시작됐습니다.');
+  } else {
+    ctx.log('이미 시작한 과제입니다. 이어서 진행합니다.');
+  }
+
+  // 3) 과제 파일 받기 + git 기준점 (이미 했으면 건너뛴다. 받다가 끊겼으면 practice start 로 다시 받는다)
+  if (!cfg.baseline) {
+    ctx.log('과제 파일을 받고 있습니다.');
     const task = await request(ctx, cfg, 'GET', '/cli/task');
     const files = Array.isArray(task.files) ? task.files : [];
-    if (files.length === 0) throw new PracticeError('서버가 과제 파일을 주지 않았습니다. 잠시 뒤 다시 시도해 주세요.');
+    if (files.length === 0) throw new PracticeError('서버가 과제 파일을 주지 않았습니다. 잠시 뒤 practice start 를 다시 실행해 주세요.');
     for (const f of files) {
       const abs = safeJoin(dir, f.path);
       if (toTop(f.path) === '.git') throw new PracticeError('쓸 수 없는 파일 경로입니다: .git');
@@ -199,6 +267,7 @@ export async function start(ctx, args = []) {
         baseline,
         testCommand: task.testCommand || null,
         deliverables: Array.isArray(task.deliverables) ? task.deliverables : [],
+        hasHidden: task.hasHidden === true,
       },
       homeOpts(ctx),
     );
@@ -207,28 +276,38 @@ export async function start(ctx, args = []) {
     cfg = updateConfig({ workspace }, homeOpts(ctx));
   }
 
-  // 2) 시계 시작 (서버는 처음 한 번만 시작한다)
-  if (!cfg.startedAt) {
-    const s = await request(ctx, cfg, 'POST', '/cli/start', {});
-    cfg = updateConfig({ startedAt: s.startedAt, deadlineAt: s.deadlineAt, status: 'started' }, homeOpts(ctx));
-    ctx.log('시간이 시작됐습니다.');
-  } else {
-    ctx.log('이미 시작한 과제입니다. 이어서 진행합니다.');
-  }
-
-  // 3) 사용량 · 제출 요청을 지켜보는 확인 프로그램
+  // 4) 사용량과 제출 요청을 지켜보는 프로그램
   const w = ensureWatch(ctx);
-  ctx.log(w.started ? '  사용량과 제출 요청을 지켜보는 프로그램을 뒤에서 켰습니다.' : '  사용량과 제출 요청을 지켜보는 프로그램이 이미 켜져 있습니다.');
+  ctx.log(w.started ? '  지켜보는 프로그램(practice watch)을 뒤에서 켰습니다. 사용량을 보내고 제출 요청을 기다립니다.' : '  지켜보는 프로그램(practice watch)이 이미 켜져 있습니다.');
 
   const deadline = parseTime(cfg.deadlineAt);
   if (deadline) ctx.log(`남은 시간: ${fmtDuration(deadline - ctx.now())}`);
   ctx.log('');
-  ctx.log('assignment/README.md 부터 읽어 보세요. 일을 맡긴 담당자에게는 연습실 창의 DM 으로 물어볼 수 있습니다.');
-  ctx.log('다 끝났으면 연습실 창의 「제출하고 문제풀기」를 누르세요. 직접 내려면 practice submit 입니다.');
+  // 과제 파일은 모두 assignment 폴더에 풀린다. 루트에서 npm 이나 codex 를 쓰면 package.json 이 없고, 결과물도 제출 폴더 밖에 만들어진다
+  if (inAssignment(ctx, dir)) {
+    ctx.log('지금 터미널이 assignment 폴더 안이라 바로 codex 나 claude 를 실행하면 됩니다.');
+  } else {
+    ctx.log('작업은 assignment 폴더 안에서 합니다. 먼저 cd assignment 를 한 번 실행하고, 그 폴더에서 codex 나 claude 를 실행하세요.');
+  }
+  ctx.log('assignment/README.md 부터 읽어 보세요. 일을 맡긴 담당자에게는 연습실 창 오른쪽 대화에서 물어볼 수 있습니다.');
+  ctx.log('다 끝났으면 연습실 창의 "제출하고 확인 문제로"를 누르세요. 직접 내려면 practice submit 입니다.');
   return cfg;
 }
 
 const toTop = (p) => String(p).replace(/\\/g, '/').split('/').filter((x) => x && x !== '.')[0];
+
+/** 지금 터미널 위치가 assignment 폴더(또는 그 안)인지 */
+function inAssignment(ctx, dir) {
+  const real = (p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const rel = path.relative(real(dir), real(ctx.cwd));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
 
 /** assignment/ 안의 것을 ~/.practice/archive/<시각>/ 으로 옮기고 그 경로를 돌려준다(.gitkeep 은 남긴다) */
 function archiveAssignment(ctx, dir) {
@@ -263,6 +342,13 @@ export function decideWatch(res, { submittedLocally = false } = {}) {
   return 'wait';
 }
 
+/** 접속 코드 문제로 서버가 거절한 응답(401, 403, 404). 이 응답이 계속 오면 기다려도 풀리지 않는다 */
+const isRejection = (e) => Boolean(e && (e.status === 401 || e.status === 403 || e.status === 404));
+/** 같은 거절이 연달아 이만큼 오면 지켜보기를 멈춘다(30초 간격이면 1분 30초) */
+export const REJECT_LIMIT = 3;
+/** 마감이 지나고 이 시간이 지나면 서버도 접속 코드를 거둔다(AXP_LIMITS.codeTtlAfterDeadlineMs) */
+const GIVE_UP_AFTER_DEADLINE_MS = 2 * 60 * 60 * 1000;
+
 export async function watch(ctx, args = [], opts = {}) {
   let cfg = readConfig(homeOpts(ctx));
   if (!cfg.token || !cfg.startedAt) {
@@ -271,24 +357,31 @@ export async function watch(ctx, args = [], opts = {}) {
   }
   const other = watchPid(ctx);
   if (other) {
-    ctx.log(`이미 켜져 있습니다 (pid ${other}).`);
+    ctx.log(`지켜보는 프로그램(practice watch)이 이미 켜져 있습니다 (pid ${other}).`);
     return { ticks: 0, submitted: false };
   }
   fs.mkdirSync(practiceHome(homeOpts(ctx)), { recursive: true });
-  fs.writeFileSync(pidPath(homeOpts(ctx)), String(process.pid));
+  fs.writeFileSync(pidPath(homeOpts(ctx)), pidRecord(process.pid));
 
   const envInterval = Number(ctx.env.PRACTICE_HEARTBEAT_MS);
   const interval = opts.intervalMs ?? (Number.isFinite(envInterval) && envInterval > 0 ? envInterval : HEARTBEAT_MS);
   const maxTicks = opts.maxTicks ?? Infinity;
   let ticks = 0;
   let submitted = false;
-  ctx.log(`지켜보기를 시작합니다 (${Math.round(interval / 1000)}초마다).`);
+  ctx.log(`지켜보는 프로그램(practice watch)을 시작합니다 (${Math.round(interval / 1000)}초마다).`);
+  let rejected = 0;
 
   try {
     while (ticks < maxTicks) {
       ticks += 1;
       cfg = readConfig(homeOpts(ctx));
       const since = parseTime(cfg.startedAt) || 0;
+      // 마감 뒤 2시간이 지나면 서버가 접속 코드를 거둔다. 그때까지 제출이 안 됐으면 더 돌아도 할 수 있는 일이 없다
+      const due = parseTime(cfg.deadlineAt);
+      if (due !== null && ctx.now() > due + GIVE_UP_AFTER_DEADLINE_MS) {
+        ctx.log('마감 시간이 2시간 넘게 지나 지켜보는 프로그램(practice watch)을 마칩니다.');
+        break;
+      }
       let res = null;
       try {
         const { usage } = collectSessions({ ...homeOpts(ctx), sinceMs: since });
@@ -297,14 +390,21 @@ export async function watch(ctx, args = [], opts = {}) {
           { deadlineAt: res.deadlineAt || cfg.deadlineAt, status: res.status || cfg.status, lastHeartbeatAt: new Date(ctx.now()).toISOString() },
           homeOpts(ctx),
         );
+        rejected = 0;
       } catch (e) {
         ctx.warn(`[${new Date(ctx.now()).toLocaleTimeString('ko-KR')}] 서버와 연결이 안 됩니다. 다음 확인 때 다시 시도합니다. (${e && e.message ? e.message : e})`);
+        // 접속 코드가 무효가 된 경우(새 코드를 받았거나 환불) 같은 거절이 영원히 이어진다. 연달아 오면 안내를 남기고 멈춘다
+        rejected = isRejection(e) ? rejected + 1 : 0;
+        if (rejected >= REJECT_LIMIT) {
+          ctx.warn('서버가 접속 코드를 계속 받아 주지 않아 지켜보는 프로그램(practice watch)을 마칩니다. 연습실 창에서 새 코드를 받았다면 practice login 새 코드 를 다시 실행하세요.');
+          break;
+        }
       }
 
       if (res) {
         const action = decideWatch(res, { submittedLocally: Boolean(readConfig(homeOpts(ctx)).submittedAt) });
         if (action === 'stop') {
-          ctx.log('제출이 끝났거나 마감된 과제입니다. 지켜보기를 마칩니다.');
+          ctx.log('제출이 끝났거나 마감된 과제입니다. 지켜보는 프로그램(practice watch)을 마칩니다.');
           break;
         }
         if (action === 'submit') {
@@ -322,7 +422,8 @@ export async function watch(ctx, args = [], opts = {}) {
     }
   } finally {
     try {
-      if (fs.readFileSync(pidPath(homeOpts(ctx)), 'utf8').trim() === String(process.pid)) fs.unlinkSync(pidPath(homeOpts(ctx)));
+      const mine = readPidRecord(pidPath(homeOpts(ctx)));
+      if (mine && mine.pid === process.pid) fs.unlinkSync(pidPath(homeOpts(ctx)));
     } catch {
       // 이미 지워졌다
     }
@@ -332,34 +433,124 @@ export async function watch(ctx, args = [], opts = {}) {
 
 /* ───────────────────────── submit ───────────────────────── */
 
-/** 숨은 테스트 파일을 잠깐 넣었다가 원래대로 되돌린다 */
-async function withFiles(dir, files, fn) {
+const lockPath = (ctx) => path.join(practiceHome(homeOpts(ctx)), 'submit.lock');
+const hiddenMarkPath = (ctx) => path.join(practiceHome(homeOpts(ctx)), 'hidden-written.json');
+
+/**
+ * 제출은 한 번에 하나만 — 터미널의 practice submit 과 뒤에서 도는 watch 의 자동 제출이 겹치면
+ * 숨은 테스트 파일을 서로 덮어써 남기거나 결과를 덮었다(10/25 검토). 잡은 프로그램이 죽었으면 그 잠금은 버린다.
+ */
+function acquireLock(ctx) {
+  fs.mkdirSync(practiceHome(homeOpts(ctx)), { recursive: true });
+  const p = lockPath(ctx);
+  for (let i = 0; i < 2; i++) {
+    try {
+      const fd = fs.openSync(p, 'wx');
+      fs.writeSync(fd, pidRecord(process.pid));
+      fs.closeSync(fd);
+      return p;
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') throw e;
+      const holder = readPidRecord(p);
+      if (holder && holder.pid !== process.pid && recordAlive(holder)) {
+        throw new PracticeError(
+          '다른 제출이 진행 중입니다. 연습실 창에서 요청한 제출이 뒤에서 돌고 있을 수 있습니다. 끝나면 연습실 창이 제출 확인 화면으로 바뀝니다. 진행은 tail -n 20 ~/.practice/watch.log 로 볼 수 있습니다.',
+          { status: 423, body: { code: 'LOCKED' } },
+        );
+      }
+      try {
+        fs.unlinkSync(p);
+      } catch {
+        // 다른 쪽이 먼저 지웠다
+      }
+    }
+  }
+  throw new PracticeError('제출을 시작하지 못했습니다. 잠시 뒤 다시 해 주세요.');
+}
+
+function releaseLock(p) {
+  try {
+    const mine = readPidRecord(p);
+    if (mine && mine.pid === process.pid) fs.unlinkSync(p);
+  } catch {
+    // 이미 없다
+  }
+}
+
+/** 써 둔 숨은 테스트 파일을 원래대로 — 있던 파일은 되살리고 새로 쓴 파일은 지운다 */
+function restoreWritten(dir, written) {
+  for (const w of [...written].reverse()) {
+    try {
+      if (w.prior !== null) fs.writeFileSync(w.abs, Buffer.from(w.prior, 'base64'));
+      else if (fs.existsSync(w.abs)) fs.unlinkSync(w.abs);
+      let parent = path.dirname(w.abs);
+      while (parent !== dir && path.relative(dir, parent) && !path.relative(dir, parent).startsWith('..')) {
+        if (fs.readdirSync(parent).length > 0) break;
+        fs.rmdirSync(parent);
+        parent = path.dirname(parent);
+      }
+    } catch {
+      // 되돌리기에 실패해도 제출은 계속한다
+    }
+  }
+}
+
+/** 지난 제출이 중간에 끊겨(Ctrl+C · 터미널 닫힘) 숨은 테스트 파일이 남았으면 치운다 */
+export function cleanupHidden(ctx) {
+  const mark = hiddenMarkPath(ctx);
+  let saved;
+  try {
+    saved = JSON.parse(fs.readFileSync(mark, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (saved && typeof saved.dir === 'string' && Array.isArray(saved.written)) restoreWritten(saved.dir, saved.written);
+  try {
+    fs.unlinkSync(mark);
+  } catch {
+    // 이미 없다
+  }
+  return true;
+}
+
+/**
+ * 숨은 테스트 파일을 잠깐 넣었다가 원래대로 되돌린다.
+ * 넣은 목록을 ~/.practice/hidden-written.json 에 먼저 적어 두고, Ctrl+C 로 끊겨도 되돌린 뒤 끝낸다.
+ * 프로그램이 통째로 죽은 경우는 다음 start · submit 이 cleanupHidden 으로 치운다.
+ */
+async function withFiles(ctx, dir, files, fn) {
   const written = [];
+  const mark = hiddenMarkPath(ctx);
+  const done = () => {
+    restoreWritten(dir, written);
+    written.length = 0;
+    try {
+      fs.unlinkSync(mark);
+    } catch {
+      // 이미 없다
+    }
+  };
+  const onSignal = () => {
+    done();
+    process.exit(130);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
   try {
     for (const f of files) {
       const abs = safeJoin(dir, f.path);
       if (toTop(f.path) === '.git') continue;
-      const prior = fs.existsSync(abs) ? fs.readFileSync(abs) : null;
+      const prior = fs.existsSync(abs) ? fs.readFileSync(abs).toString('base64') : null;
+      written.push({ abs, prior });
+      fs.writeFileSync(mark, JSON.stringify({ dir, written }));
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, typeof f.content === 'string' ? f.content : '', 'utf8');
-      written.push({ abs, prior });
     }
     return await fn();
   } finally {
-    for (const w of written.reverse()) {
-      try {
-        if (w.prior !== null) fs.writeFileSync(w.abs, w.prior);
-        else fs.unlinkSync(w.abs);
-        let parent = path.dirname(w.abs);
-        while (parent !== dir && path.relative(dir, parent) && !path.relative(dir, parent).startsWith('..')) {
-          if (fs.readdirSync(parent).length > 0) break;
-          fs.rmdirSync(parent);
-          parent = path.dirname(parent);
-        }
-      } catch {
-        // 되돌리기에 실패해도 제출은 계속한다
-      }
-    }
+    done();
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
   }
 }
 
@@ -368,123 +559,112 @@ export async function submit(ctx, args = [], opts = {}) {
   if (!cfg.token || !cfg.sessionId) throw new PracticeError('먼저 practice login <코드> 를 실행해 주세요.');
   if (!cfg.startedAt || !cfg.baseline) throw new PracticeError('아직 시작하지 않았습니다. practice start 를 먼저 실행해 주세요.');
   if (cfg.submittedAt && !args.includes('--again')) {
-    ctx.log('이미 제출했습니다. 연습실 창으로 돌아가 확인 문제를 푸세요.');
+    ctx.log('이미 제출했습니다. 연습실 창으로 돌아가 확인 문제를 푸세요. 확인 문제를 시작하기 전이면 고친 뒤 practice submit --again 으로 다시 올릴 수 있습니다.');
     return { ok: true, already: true, panelUrl: cfg.panelUrl || null };
   }
 
   const workspace = resolveWorkspace(ctx, cfg);
   const dir = assignmentOf(workspace);
   if (!fs.existsSync(dir)) throw new PracticeError('assignment 폴더를 찾지 못했습니다. 작업 공간의 맨 위 폴더에서 실행해 주세요.');
-  const since = parseTime(cfg.startedAt) || 0;
-  const steps = 7;
-  let step = 0;
-  const say = (m) => ctx.log(`[${++step}/${steps}] ${m}`);
-
-  // 보이는 테스트
-  let tests = [];
-  const tails = [];
-  say(cfg.testCommand ? `테스트를 돌립니다 (${cfg.testCommand})` : '이 과제는 테스트 명령이 없어 건너뜁니다');
-  if (cfg.testCommand) {
-    const r = await runTests({ command: cfg.testCommand, cwd: dir, hidden: false, env: ctx.env });
-    tests = tests.concat(r.tests);
-    tails.push(`# 보이는 테스트\n${r.tail}`);
-  }
-
-  // 커밋과 diff
-  say('작업 내용(커밋 · 변경 내용)을 모읍니다');
-  const commits = await getCommits(dir, cfg.baseline);
-  const { diff, truncated } = await getDiff(dir, cfg.baseline);
-
-  // 숨은 테스트 (제출 요청 뒤나 마감 뒤에만 받을 수 있다)
-  say('확인용 테스트를 받아 돌립니다');
+  const lock = acquireLock(ctx);
   try {
-    const hidden = await request(ctx, cfg, 'GET', '/cli/hidden-tests', undefined, { retries: 2 });
+    cleanupHidden(ctx);
+    const since = parseTime(cfg.startedAt) || 0;
+    const steps = 7;
+    let step = 0;
+    const say = (m) => ctx.log(`[${++step}/${steps}] ${m}`);
+
+    // 제출 요청 — 연습실 창의 단추와 같다. 이때부터 담당자 대화가 닫히고 확인용 테스트를 받을 수 있다
+    say('제출을 요청합니다');
+    try {
+      await request(ctx, cfg, 'POST', '/cli/submit-request', {}, { retries: 2 });
+    } catch (e) {
+      // 이미 제출한 응시를 --again 으로 다시 내는 경우는 그대로 이어 간다(서버가 확인 문제 전까지 받아 준다)
+      if (!(e instanceof PracticeError && e.body && e.body.code === 'SUBMITTED')) throw e;
+    }
+
+    // 보이는 테스트
+    let tests = [];
+    const tails = [];
+    say(cfg.testCommand ? `테스트를 돌립니다 (${cfg.testCommand})` : '이 과제는 테스트 명령이 없어 건너뜁니다');
+    if (cfg.testCommand) {
+      const r = await runTests({ command: cfg.testCommand, cwd: dir, hidden: false, env: ctx.env });
+      tests = tests.concat(r.tests);
+      tails.push(`# 보이는 테스트\n${r.tail}`);
+    }
+
+    // 커밋과 diff
+    say('작업 내용(커밋과 변경 내용)을 모읍니다');
+    const commits = await getCommits(dir, cfg.baseline);
+    const { diff, truncated } = await getDiff(dir, cfg.baseline);
+
+    // 확인용 테스트 — 못 받으면 제출을 멈춘다. 없이 내면 숨은 요구사항이 모두 못 맞춘 것으로 채점된다(10/25 검토)
+    say('확인용 테스트를 받아 돌립니다');
+    let hidden;
+    try {
+      hidden = await request(ctx, cfg, 'GET', '/cli/hidden-tests', undefined, { retries: 2 });
+    } catch (e) {
+      // 이미 끝난 연습(409)이나 아직 받을 수 없는 때(403)는 잠시 뒤에 해도 달라지지 않는다. 다시 해 보라고 하지 않는다
+      const retryable = !(e && e.status && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429);
+      const why = e && e.message ? e.message : String(e);
+      throw new PracticeError(`확인용 테스트를 받지 못해 제출을 멈췄습니다. ${why}${retryable ? ' practice submit 을 다시 실행해 주세요.' : ''}`, {
+        status: e && e.status,
+        body: e && e.body,
+      });
+    }
     const hfiles = Array.isArray(hidden.files) ? hidden.files : [];
     if (hfiles.length && hidden.command) {
-      const r = await withFiles(dir, hfiles, () => runTests({ command: hidden.command, cwd: dir, hidden: true, env: ctx.env, timeoutMs: 180_000 }));
+      const r = await withFiles(ctx, dir, hfiles, () => runTests({ command: hidden.command, cwd: dir, hidden: true, env: ctx.env, timeoutMs: 180_000 }));
       tests = tests.concat(r.tests);
       tails.push(`# 확인용 테스트\n${r.tail}`);
+    } else if (cfg.hasHidden) {
+      throw new PracticeError('확인용 테스트가 비어 있어 제출을 멈췄습니다. 잠시 뒤 practice submit 을 다시 실행해 주세요. 계속 같으면 연습실 창의 문제 신고로 알려 주세요.');
     } else {
       ctx.log('  이 과제에는 확인용 테스트가 없습니다.');
     }
-  } catch (e) {
-    if (e instanceof PracticeError && e.status && e.status < 500) {
-      ctx.warn('  확인용 테스트는 연습실 창에서 제출을 요청한 뒤에 받을 수 있어 이번에는 건너뜁니다. 연습실 창의 「제출하고 문제풀기」로 내면 함께 돌아갑니다.');
-    } else {
-      ctx.warn(`  확인용 테스트를 받지 못해 건너뜁니다. (${e && e.message ? e.message : e})`);
-    }
-  }
 
-  // 파일 · 결과물 · AI 기록
-  say('파일과 결과물을 읽습니다');
-  const files = listFiles(dir);
-  const deliverables = readDeliverables(dir, cfg.deliverables || []);
-  say('AI 사용 기록(Codex · Claude Code)을 읽습니다');
-  const { usage, prompts } = collectSessions({ ...homeOpts(ctx), sinceMs: since });
-  const skills = readSkills({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
-  const mcp = readMcp({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
-  const shellHistory = readShellHistory(homeOpts(ctx));
+    // 파일 · 결과물 · AI 기록 (비밀이 들기 쉬운 .env 같은 파일은 목록에서 빼고, 비밀 값은 가려서 보낸다)
+    say('파일과 결과물을 읽습니다');
+    const files = listFiles(dir);
+    const deliverables = readDeliverables(dir, cfg.deliverables || []);
+    say('AI 사용 기록(Codex와 Claude Code)을 읽습니다');
+    const { usage, prompts } = collectSessions({ ...homeOpts(ctx), sinceMs: since });
+    const skills = readSkills({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
+    const mcp = readMcp({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
+    const shellHistory = readShellHistory({ ...homeOpts(ctx), mark: cfg.histMark || null });
 
-  // 묶음 올리기
-  say('작업 폴더를 묶어 올립니다');
-  let bundleKey = null;
-  let bundleBytes = 0;
-  const tmpFile = path.join(os.tmpdir(), `practice-${cfg.sessionId}-${process.pid}.tar.gz`);
-  try {
-    const bytes = await createBundle({ workspaceDir: workspace, assignmentDir: dir, outFile: tmpFile });
-    if (bytes > BUNDLE_MAX_BYTES) {
-      ctx.warn(`  작업 폴더가 ${Math.round(bytes / 1048576)}MB 로 한도(20MB)를 넘어 묶음은 올리지 않습니다. 코드와 결과물 글은 그대로 제출됩니다.`);
-    } else {
-      try {
-        const init = await request(ctx, cfg, 'POST', '/cli/submit/init', { bytes }, { retries: 2 });
-        if (init.uploadUrl) {
-          await putBundle(ctx, init.uploadUrl, fs.readFileSync(tmpFile));
-          bundleKey = init.bundleKey || null;
-          bundleBytes = bytes;
-        }
-      } catch (e) {
-        // 묶음은 보조 자료다. 못 올려도 manifest 로 제출은 이어 간다
-        ctx.warn(`  묶음을 올리지 못했지만 코드와 결과물 글은 그대로 제출합니다. (${e && e.message ? e.message : e})`);
-      }
-    }
-  } catch (e) {
-    ctx.warn(`  작업 폴더를 묶지 못했지만 제출은 이어 갑니다. (${e && e.message ? e.message : e})`);
+    // 마무리
+    say('제출합니다');
+    const manifest = assembleManifest({
+      cliVersion: CLI_VERSION,
+      commits,
+      diff,
+      diffTruncated: truncated,
+      tests,
+      testOutputTail: tails.join('\n\n'),
+      files,
+      deliverables,
+      prompts,
+      usage,
+      skills,
+      mcp,
+      shellHistory,
+    });
+    const done = await request(ctx, cfg, 'POST', '/cli/submit/complete', { manifest }, { retries: 3, timeoutMs: 60_000 });
+    cfg = updateConfig({ submittedAt: new Date(ctx.now()).toISOString(), panelUrl: done.panelUrl || cfg.panelUrl || null, status: 'submitted' }, homeOpts(ctx));
+
+    const passed = tests.filter((t) => t.passed).length;
+    ctx.log('');
+    // 연습실 창의 제출 화면과 같은 이름으로 부른다(「AI에게 보낸 요청」). 테스트가 없는 과제는 0/0 대신 없다고 적는다
+    const testText = tests.length ? `테스트 ${passed}/${tests.length} 통과` : '테스트 없음';
+    ctx.log(`제출했습니다. ${testText}, 파일 ${files.length}개, AI에게 보낸 요청 ${prompts.length}개`);
+    if (done.late) ctx.log('마감 시각이 지난 뒤에 요청한 제출이라 리포트에 "마감 뒤 제출"로 적힙니다.');
+    ctx.log('연습실 창으로 돌아가 확인 문제를 푸세요.');
+    if (cfg.panelUrl) ctx.log(cfg.panelUrl);
+    return { ok: true, already: false, panelUrl: cfg.panelUrl || null, manifest, auto: Boolean(opts.auto) };
   } finally {
-    try {
-      fs.unlinkSync(tmpFile);
-    } catch {
-      // 임시 파일이 없다
-    }
+    releaseLock(lock);
   }
-
-  // 마무리
-  say('제출합니다');
-  const manifest = assembleManifest({
-    cliVersion: CLI_VERSION,
-    commits,
-    diff,
-    diffTruncated: truncated,
-    tests,
-    testOutputTail: tails.join('\n\n'),
-    files,
-    deliverables,
-    prompts,
-    usage,
-    skills,
-    mcp,
-    shellHistory,
-    bundleKey,
-    bundleBytes,
-  });
-  const done = await request(ctx, cfg, 'POST', '/cli/submit/complete', { manifest }, { retries: 3, timeoutMs: 60_000 });
-  cfg = updateConfig({ submittedAt: new Date(ctx.now()).toISOString(), panelUrl: done.panelUrl || cfg.panelUrl || null, status: 'submitted' }, homeOpts(ctx));
-
-  const passed = tests.filter((t) => t.passed).length;
-  ctx.log('');
-  ctx.log(`제출했습니다. 테스트 ${passed}/${tests.length} 통과 · 파일 ${files.length}개 · 프롬프트 ${prompts.length}개`);
-  ctx.log('연습실 창으로 돌아가 확인 문제를 푸세요.');
-  if (cfg.panelUrl) ctx.log(cfg.panelUrl);
-  return { ok: true, already: false, panelUrl: cfg.panelUrl || null, manifest, auto: Boolean(opts.auto) };
 }
 
 /* ───────────────────────── status ───────────────────────── */
@@ -515,19 +695,20 @@ export async function status(ctx) {
   }
 
   const st = (res && res.status) || cfg.status || '';
-  ctx.log(`상태: ${cfg.submittedAt ? '제출 완료' : st === 'started' ? '진행 중' : st || '알 수 없음'}`);
+  // 서버 상태값(created 같은 영어)을 그대로 찍지 않는다
+  ctx.log(`상태: ${cfg.submittedAt ? STATUS_TEXT.submitted : STATUS_TEXT[st] || '알 수 없음'}`);
   const deadline = parseTime((res && res.deadlineAt) || cfg.deadlineAt);
   const nowMs = res && parseTime(res.now) !== null ? parseTime(res.now) : ctx.now();
   if (deadline !== null && !cfg.submittedAt) ctx.log(deadline > nowMs ? `남은 시간: ${fmtDuration(deadline - nowMs)}` : '남은 시간: 마감됐습니다');
 
   for (const u of usage) {
     const label = u.tool === 'codex' ? 'Codex' : 'Claude Code';
-    ctx.log(`${label}: 입력 ${fmtTokens(u.inputTokens)} · 출력 ${fmtTokens(u.outputTokens)} · 캐시 ${fmtTokens(u.cachedTokens)} 토큰 · 프롬프트 ${u.prompts}개${u.model ? ` (${u.model})` : ''}`);
+    ctx.log(`${label}: 입력 ${fmtTokens(u.inputTokens)}, 출력 ${fmtTokens(u.outputTokens)}, 캐시 ${fmtTokens(u.cachedTokens)} 토큰, 보낸 요청 ${u.prompts}개${u.model ? ` (${u.model})` : ''}`);
   }
 
   if (!cfg.submittedAt && !TERMINAL_STATUS.has(String(st))) {
     const w = ensureWatch(ctx);
-    ctx.log(w.started ? '지켜보는 프로그램이 꺼져 있어 다시 켰습니다.' : `지켜보는 프로그램: 켜져 있음 (pid ${w.pid})`);
+    ctx.log(w.started ? '지켜보는 프로그램(practice watch)이 꺼져 있어 다시 켰습니다.' : `지켜보는 프로그램(practice watch): 켜져 있음 (pid ${w.pid})`);
   }
   return { connected: true, started: true, status: st, usage };
 }
