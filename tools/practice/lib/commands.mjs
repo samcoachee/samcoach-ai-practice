@@ -173,9 +173,13 @@ export async function start(ctx, args = []) {
   // 1) 과제 파일 받기 + git 기준점 (이미 했으면 건너뛴다)
   if (!cfg.baseline) {
     const leftover = fs.readdirSync(dir).filter((n) => n !== '.gitkeep');
-    if (leftover.length > 0 && !force) {
+    // 같은 작업 공간에서 다음 과제를 하면 앞 과제 폴더가 남아 있다. practice 가 만든 폴더(.git 이 있다)면 지우지 않고 옮겨 둔다
+    if (leftover.length > 0 && (force || leftover.includes('.git'))) {
+      const archived = archiveAssignment(ctx, dir);
+      ctx.log(`  앞 과제 파일은 ${archived} 로 옮겨 두었습니다.`);
+    } else if (leftover.length > 0) {
       throw new PracticeError(
-        'assignment 폴더가 비어 있지 않습니다. 이전에 받은 파일이면 practice start --force 로 다시 받습니다(직접 고친 내용은 사라집니다).',
+        'assignment 폴더가 비어 있지 않습니다. 이전에 받은 파일이면 practice start --force 로 다시 받습니다(있던 파일은 ~/.practice/archive 로 옮겨 둡니다).',
       );
     }
     ctx.log('과제 파일을 받는 중...');
@@ -225,6 +229,26 @@ export async function start(ctx, args = []) {
 }
 
 const toTop = (p) => String(p).replace(/\\/g, '/').split('/').filter((x) => x && x !== '.')[0];
+
+/** assignment/ 안의 것을 ~/.practice/archive/<시각>/ 으로 옮기고 그 경로를 돌려준다(.gitkeep 은 남긴다) */
+function archiveAssignment(ctx, dir) {
+  const stamp = new Date(ctx.now()).toISOString().replace(/[:.]/g, '-');
+  const dest = path.join(practiceHome(homeOpts(ctx)), 'archive', stamp);
+  fs.mkdirSync(dest, { recursive: true });
+  for (const name of fs.readdirSync(dir)) {
+    if (name === '.gitkeep') continue;
+    const from = path.join(dir, name);
+    const to = path.join(dest, name);
+    try {
+      fs.renameSync(from, to);
+    } catch {
+      // 다른 디스크면 rename 이 안 된다 — 복사 뒤 지운다
+      fs.cpSync(from, to, { recursive: true });
+      fs.rmSync(from, { recursive: true, force: true });
+    }
+  }
+  return dest;
+}
 
 /* ───────────────────────── watch ───────────────────────── */
 
