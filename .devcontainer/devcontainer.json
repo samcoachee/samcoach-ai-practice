@@ -1,0 +1,44 @@
+// AI 업무 과제 연습실 작업 공간 (GitHub Codespaces 에서 열린다)
+{
+  "name": "AI 업무 과제 연습실",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+  "hostRequirements": {
+    "cpus": 2
+  },
+  "containerEnv": {
+    "TZ": "Asia/Seoul",
+    "LANG": "C.UTF-8"
+  },
+  // practice CLI 와 Codex 를 설치하고, 셸 기록이 바로 파일에 남게 한다
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "forwardPorts": [3000, 5173, 8000, 8080],
+  "portsAttributes": {
+    "3000": { "label": "미리보기 3000", "onAutoForward": "notify" },
+    "5173": { "label": "미리보기 5173", "onAutoForward": "openPreview" },
+    "8000": { "label": "미리보기 8000", "onAutoForward": "notify" },
+    "8080": { "label": "미리보기 8080", "onAutoForward": "notify" }
+  },
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["README.md"]
+    },
+    "vscode": {
+      "extensions": ["MS-CEINTL.vscode-language-pack-ko"],
+      "settings": {
+        "workbench.startupEditor": "none",
+        "workbench.panel.defaultLocation": "bottom",
+        "editor.minimap.enabled": false,
+        "editor.wordWrap": "on",
+        "files.autoSave": "off",
+        "terminal.integrated.defaultLocation": "view",
+        "terminal.integrated.fontSize": 14,
+        "explorer.confirmDelete": false,
+        "telemetry.telemetryLevel": "off"
+      }
+    }
+  }
+}

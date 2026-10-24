@@ -1,0 +1,4 @@
+node_modules/
+# practice start 가 assignment/ 안에 따로 git 저장소를 만든다. 템플릿에는 빈 폴더 표시만 남긴다
+/assignment/*
+!/assignment/.gitkeep
