@@ -477,29 +477,67 @@ export function readShellHistory({ env = process.env, home = os.homedir(), mark 
 // 작업 폴더 묶음(tar)은 1.1 부터 만들지 않는다 — 확인 문제와 채점은 이 manifest 만 읽는다(서버 cli/submit/init 410)
 
 /** SubmitManifest 로 맞춘다(순수). 길이 · 개수 상한을 여기서 건다 */
+// 서버(src/lib/ax-practice/server.ts sanitizeManifest)가 받는 개수와 같게 — 더 보내면 서버가 앞쪽만 남겨 최근 지시가 빠졌다(10/25 시스템 검토 #55)
+const SEND_PROMPTS_HEAD = 50;
+const SEND_PROMPTS_TAIL = 250;
+const SEND_FILES_MAX = 2000;
+const SEND_TESTS_MAX = 500;
+/** 서버는 본문이 3MB 를 넘으면 413 으로 돌려보낸다. 여유를 두고 이 크기 안으로 줄여 보낸다 */
+export const SEND_MAX_BYTES = 2_600_000;
+
+/** 지시 글이 많으면 처음 몇 개와 최근 것을 남긴다(처음 지시와 마지막 마무리를 둘 다 본다) */
+function keepHeadTail(list, head, tail) {
+  return list.length <= head + tail ? list : [...list.slice(0, head), ...list.slice(list.length - tail)];
+}
+
+/**
+ * 보낼 본문이 SEND_MAX_BYTES 를 넘으면 채점에 덜 쓰이는 것부터 줄인다 — 지시 글 길이, 지시 글 개수, 테스트 출력, 파일 목록, 변경 내용 순.
+ * 결과물 글은 채점 대상이라 줄이지 않는다(서버가 결과물 합계 1MB 를 따로 본다).
+ */
+export function fitManifest(m, maxBytes = SEND_MAX_BYTES) {
+  const size = () => Buffer.byteLength(JSON.stringify({ manifest: m }), 'utf8');
+  if (size() <= maxBytes) return m;
+  m.prompts = m.prompts.map((p) => ({ ...p, text: clip(p.text, 800) }));
+  if (size() <= maxBytes) return m;
+  m.prompts = keepHeadTail(m.prompts, 20, 130);
+  if (size() <= maxBytes) return m;
+  m.testOutputTail = tail(m.testOutputTail, 2000);
+  m.shellHistory = m.shellHistory.slice(-80);
+  if (size() <= maxBytes) return m;
+  m.files = m.files.slice(0, 800);
+  if (size() <= maxBytes) return m;
+  const cut = Buffer.from(m.diff, 'utf8').subarray(0, 60_000).toString('utf8').replace(/�+$/, '');
+  if (cut.length < m.diff.length) {
+    m.diff = cut;
+    m.diffTruncated = true;
+  }
+  return m;
+}
+
 export function assembleManifest(parts) {
   const diffBuf = Buffer.from(parts.diff || '', 'utf8');
   const diffTooLong = diffBuf.length > DIFF_MAX_BYTES;
   const diff = diffTooLong ? diffBuf.subarray(0, DIFF_MAX_BYTES).toString('utf8').replace(/�+$/, '') : parts.diff || '';
   // 비밀 값은 보내기 전에 가린다 — 변경 내용 · 지시 글 · 결과물 · 테스트 출력까지(10/25 검토). 서버도 한 번 더 가린다
-  const prompts = [...(parts.prompts || [])]
-    .sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0))
-    .slice(0, 500)
-    .map((p) => ({ at: p.at, tool: p.tool, text: redactSecrets(clip(p.text, PROMPT_MAX_CHARS)) }));
+  const prompts = keepHeadTail(
+    [...(parts.prompts || [])].sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)),
+    SEND_PROMPTS_HEAD,
+    SEND_PROMPTS_TAIL,
+  ).map((p) => ({ at: p.at, tool: p.tool, text: redactSecrets(clip(p.text, PROMPT_MAX_CHARS)) }));
   const deliverables = {};
   for (const [k, v] of Object.entries(parts.deliverables || {})) deliverables[k] = redactSecrets(v);
-  return {
+  return fitManifest({
     cliVersion: parts.cliVersion || CLI_VERSION,
     commits: (parts.commits || []).slice(0, 500).map((c) => ({ ...c, message: redactSecrets(c.message) })),
     diff: redactSecrets(diff),
     diffTruncated: Boolean(parts.diffTruncated) || diffTooLong,
-    tests: (parts.tests || []).slice(0, 1000).map((t) => {
+    tests: (parts.tests || []).slice(0, SEND_TESTS_MAX).map((t) => {
       const row = { name: clip(t.name, 300), passed: Boolean(t.passed), hidden: Boolean(t.hidden) };
       if (t.message) row.message = redactSecrets(clip(t.message, 300));
       return row;
     }),
     testOutputTail: redactSecrets(tail(parts.testOutputTail || '', 6000)),
-    files: (parts.files || []).slice(0, 3000),
+    files: (parts.files || []).slice(0, SEND_FILES_MAX),
     deliverables,
     prompts,
     usage: parts.usage || [],
@@ -508,5 +546,5 @@ export function assembleManifest(parts) {
     shellHistory: (parts.shellHistory || []).slice(-200),
     bundleKey: null,
     bundleBytes: 0,
-  };
+  });
 }
