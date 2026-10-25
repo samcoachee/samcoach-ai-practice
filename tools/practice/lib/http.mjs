@@ -74,7 +74,7 @@ export async function request(ctx, cfg, method, apiPath, body, opts = {}) {
     if (attempt > 0) {
       const wait = retryBaseMs(ctx) * 2 ** (attempt - 1);
       const secs = Math.round(wait / 1000) || 1;
-      ctx.warn(lastWasNetwork ? `  서버에 연결하지 못했습니다. ${secs}초 뒤 다시 시도합니다 (${attempt}/${retries})` : `  서버가 바쁩니다. ${secs}초 뒤 다시 시도합니다 (${attempt}/${retries})`);
+      ctx.warn(lastWasNetwork ? `  서버에 닿지 못했습니다. ${secs}초 뒤 다시 시도합니다 (${attempt}/${retries})` : `  서버가 바쁩니다. ${secs}초 뒤 다시 시도합니다 (${attempt}/${retries})`);
       await sleep(wait);
     }
     let res;
@@ -87,7 +87,7 @@ export async function request(ctx, cfg, method, apiPath, body, opts = {}) {
       });
     } catch (e) {
       lastError = new PracticeError(
-        `서버에 연결하지 못했습니다. 인터넷 연결을 확인하고 잠시 뒤 다시 해 주세요. (${server})`,
+        `서버에 닿지 못했습니다. 인터넷이 켜져 있는지 보고 잠시 뒤 다시 해 주세요. (${server})`,
         { body: String(e && e.message ? e.message : e) },
       );
       lastWasNetwork = true;

@@ -780,7 +780,7 @@ export async function submit(ctx, args = [], opts = {}) {
 export async function status(ctx) {
   let cfg = readConfig(homeOpts(ctx));
   if (!cfg.token || !cfg.sessionId) {
-    ctx.log('연결되지 않았습니다. 연습실 창에서 접속 코드를 받아 practice login <코드> 를 실행해 주세요.');
+    ctx.log('아직 로그인하지 않았습니다. 연습실 창에서 접속 코드를 받아 practice login <코드> 를 실행해 주세요.');
     return { connected: false };
   }
   ctx.log(`과제: ${cfg.task && cfg.task.title ? cfg.task.title : '(이름 없음)'}`);
