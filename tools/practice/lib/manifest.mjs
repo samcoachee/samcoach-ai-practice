@@ -10,11 +10,13 @@ import {
   DELIVERABLES_MAX_BYTES,
   DIFF_MAX_BYTES,
   PROMPT_MAX_CHARS,
+  SECRET_FILE_GLOBS,
   clip,
   isSecretFile,
   redactSecrets,
   safeJoin,
   stripAnsi,
+  stripNul,
   tail,
   toPosix,
 } from './util.mjs';
@@ -120,29 +122,18 @@ async function git(args, cwd, opts = {}) {
   return r;
 }
 
-const DEFAULT_GITIGNORE = ['node_modules/', '.venv/', '__pycache__/', '*.pyc', '.DS_Store', '.env', '.env.*', '*.pem', ''].join('\n');
+const DEFAULT_GITIGNORE = ['node_modules/', '.venv/', '__pycache__/', '*.pyc', '.DS_Store', '.env', '.env.*', '.envrc', '*.pem', ''].join('\n');
 
 // 변경 내용에서 뺄 파일 — 비밀이 들기 쉬운 것과, 크기만 크고 채점에 쓰지 않는 잠금 파일(앞에서 잘리면 src 변경이 빠진다)
-// 비밀 파일은 util.mjs isSecretFile 과 같은 이름을 뺀다(10/25 시스템 검토 — 파일 목록은 빼고 변경 내용에는 남던 이름이 있었다)
-const DIFF_EXCLUDES = [
-  ':(glob,exclude)**/.env',
-  ':(glob,exclude)**/.env.*',
-  ':(glob,exclude)**/*.pem',
-  ':(glob,exclude)**/*.key',
-  ':(glob,exclude)**/*.p12',
-  ':(glob,exclude)**/*.pfx',
-  ':(glob,exclude)**/id_rsa*',
-  ':(glob,exclude)**/id_ed25519*',
-  ':(glob,exclude)**/id_ecdsa*',
-  ':(glob,exclude)**/id_dsa*',
-  ':(glob,exclude)**/.npmrc',
-  ':(glob,exclude)**/.netrc',
+// 비밀 파일 이름은 util.mjs SECRET_FILE_GLOBS 한 곳에서 가져온다(파일 목록의 isSecretFile 과 같은 목록). git 의 icase 로 KEY.PEM · .ENV 같은 대문자도 뺀다(10/25 2차 검토)
+export const DIFF_EXCLUDES = [
+  ...SECRET_FILE_GLOBS.map((g) => `:(glob,icase,exclude)**/${g}`),
   ':(glob,exclude)**/package-lock.json',
   ':(glob,exclude)**/node_modules/**',
 ];
 
-/** assignment/ 에 git 을 만들고 첫 커밋(기준점)을 남긴다. 기준점 커밋 해시를 돌려준다 */
-export async function initRepo(dir) {
+/** assignment/ 에 git 을 만들고 첫 커밋(기준점)을 남긴다. 기준점 커밋 해시를 돌려준다. sessionId 가 있으면 저장소 설정에 적어 둔다 */
+export async function initRepo(dir, sessionId = null) {
   const gi = path.join(dir, '.gitignore');
   if (!fs.existsSync(gi)) fs.writeFileSync(gi, DEFAULT_GITIGNORE, 'utf8');
   if (!fs.existsSync(path.join(dir, '.git'))) {
@@ -150,6 +141,7 @@ export async function initRepo(dir) {
     if (r.code !== 0) r = await git(['init'], dir);
     if (r.code !== 0) throw new PracticeError(`git 저장소를 만들지 못했습니다. ${tail(r.stderr, 200)}`);
   }
+  await tagRepoSession(dir, sessionId);
   await git(['add', '-A'], dir);
   const c = await git(['commit', '--allow-empty', '-m', 'practice: 시작 기준점'], dir);
   if (c.code !== 0) throw new PracticeError(`첫 커밋을 만들지 못했습니다. ${tail(c.stderr, 200)}`);
@@ -157,6 +149,31 @@ export async function initRepo(dir) {
   const sha = head.stdout.trim();
   if (!sha) throw new PracticeError('기준점 커밋을 확인하지 못했습니다.');
   return sha;
+}
+
+/**
+ * 이 저장소가 어느 응시(세션)의 작업 폴더인지 .git/config 에 적어 둔다. .git 안이라 변경 내용에 섞이지 않는다.
+ * 작업 공간을 다시 만든 뒤(홈 폴더의 설정이 사라진 뒤) 같은 응시의 폴더인지 알아보는 표시다(10/25 2차 검토).
+ */
+export async function tagRepoSession(dir, sessionId) {
+  if (!sessionId) return;
+  await git(['config', 'practice.session', String(sessionId)], dir);
+}
+
+/** tagRepoSession 으로 적어 둔 응시 번호. .git 이 없거나 적힌 게 없으면 null (상위 폴더의 저장소를 잘못 읽지 않게 .git 부터 본다) */
+export async function readRepoSession(dir) {
+  if (!fs.existsSync(path.join(dir, '.git'))) return null;
+  const r = await git(['config', '--get', 'practice.session'], dir);
+  return r.code === 0 ? r.stdout.trim() || null : null;
+}
+
+/** 저장소에서 가장 오래된 커밋(practice 가 남긴 시작 기준점) 해시 */
+export async function repoBaseline(dir) {
+  if (!fs.existsSync(path.join(dir, '.git'))) return null;
+  const r = await git(['rev-list', '--max-parents=0', 'HEAD'], dir);
+  if (r.code !== 0) return null;
+  const oldest = r.stdout.split('\n').map((l) => l.trim()).filter(Boolean).pop();
+  return oldest && /^[0-9a-f]{40}$/.test(oldest) ? oldest : null;
 }
 
 /** git log --shortstat 출력 해석(순수) */
@@ -198,9 +215,28 @@ export async function getDiff(dir, base) {
 // node --test 의 spec 출력이 성공 줄 앞에 붙이는 표시 세 가지(실패 표시는 아래 정규식에 있다)
 const SPEC_PASS = '\u2714\u2713\u221a';
 
+/** 정규식에 넣기 전에 줄을 자르는 길이. 공백이 수만 자 이어진 줄에서 정규식이 제곱 시간으로 느려지는 것을 막는다(10/25 2차 검토) */
+const OUTPUT_LINE_MAX = 500;
+/** 값 비교 줄(「2 == 3」 「a !== b」) 모양 - 숨은 테스트의 기대값이 이 줄에 실려 나온다 */
+const COMPARE_LINE = /!==|===|==|!=/;
+
+/**
+ * 실패 이유 줄들 -> 한 줄 message.
+ * 보이는 테스트는 앞 세 줄을 이어 붙인다. 숨은 테스트는 첫 줄만 쓴다 - 둘째 줄부터는 「3 !== 4」처럼 기대값이 실려 나오고,
+ * 리포트에 그대로 적히면 손님이 숨은 요구사항을 알아낼 수 있다. 첫 줄이 값 비교 모양(assert.equal 의 「2 == 3」)이면 그 줄도 쓰지 않는다.
+ */
+export function failMessage(lines, hidden = false) {
+  const useful = (lines || []).map((l) => String(l).trim()).filter(Boolean);
+  if (useful.length === 0) return '';
+  if (!hidden) return clip(useful.slice(0, 3).join(' ').replace(/\s+/g, ' ').trim(), 300);
+  const first = useful[0];
+  return COMPARE_LINE.test(first) ? '결과가 기대한 값과 다릅니다' : clip(first.replace(/\s+/g, ' '), 300);
+}
+
 /**
  * node --test 출력(spec · tap)을 해석한다. 모르는 줄은 건너뛴다.
  * 같은 이름이 두 번 나오면(실패 요약 등) 하나라도 실패면 실패.
+ * tap 은 여러 줄 오류를 「error: |-」 아래 들여쓴 블록으로 쓴다(assert.strictEqual · deepEqual 이 실패한 경우). 그 블록을 모아 message 로 쓴다.
  */
 export function parseTestOutput(raw, hidden = false) {
   const text = stripAnsi(raw);
@@ -226,16 +262,36 @@ export function parseTestOutput(raw, hidden = false) {
   let failLines = [];
   const flushFail = () => {
     if (failName && failLines.length) {
-      const msg = clip(failLines.slice(0, 3).join(' ').replace(/\s+/g, ' ').trim(), 300);
+      const msg = failMessage(failLines, hidden);
       const t = byName.get(failName);
-      if (t && !t.message) t.message = msg;
+      if (t && !t.message && msg) t.message = msg;
     }
     failName = null;
     failLines = [];
   };
 
   let lastTapFail = null;
-  for (const line of text.split(/\r?\n/)) {
+  // \u300cerror: |-\u300d \ube14\ub85d\uc744 \ubaa8\uc73c\ub294 \uc911\uc774\uba74 { name, indent, lines }. indent \ub294 error: \uc904\uc758 \ub4e4\uc5ec\uc4f0\uae30
+  let tapBlock = null;
+  const flushTapBlock = () => {
+    if (tapBlock) {
+      const msg = failMessage(tapBlock.lines, hidden);
+      const t = byName.get(tapBlock.name);
+      if (t && !t.message && msg) t.message = msg;
+    }
+    tapBlock = null;
+  };
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.length > OUTPUT_LINE_MAX ? rawLine.slice(0, OUTPUT_LINE_MAX) : rawLine;
+    if (tapBlock) {
+      const indent = line.length - line.trimStart().length;
+      // \ube48 \uc904\uc774\uac70\ub098 error: \ubcf4\ub2e4 \ub354 \ub4e4\uc5ec\uc4f4 \uc904\uc774\uba74 \ube14\ub85d \uc548\ucabd. \uac19\uac70\ub098 \ub35c \ub4e4\uc5ec\uc4f4 \uc904(code: \ub4f1)\uc5d0\uc11c \ube14\ub85d\uc774 \ub05d\ub098\uace0, \uadf8 \uc904\uc740 \uc544\ub798\uc5d0\uc11c \ub2e4\uc2dc \ubcf8\ub2e4
+      if (!line.trim() || indent > tapBlock.indent) {
+        tapBlock.lines.push(line);
+        continue;
+      }
+      flushTapBlock();
+    }
     if (/^\s*[\u2716\u2717\u00d7]\s+failing tests:/.test(line)) {
       inFailSummary = true;
       continue;
@@ -267,10 +323,17 @@ export function parseTestOutput(raw, hidden = false) {
       continue;
     }
     if (lastTapFail) {
+      const block = line.match(/^(\s*)error:\s*[|>][+-]?\s*$/);
+      if (block) {
+        tapBlock = { name: lastTapFail, indent: block[1].length, lines: [] };
+        lastTapFail = null;
+        continue;
+      }
       const e = line.match(/^\s*error:\s*(.+)$/);
       if (e) {
         const t = byName.get(lastTapFail);
-        if (t && !t.message) t.message = clip(e[1].replace(/^['"]|['"]$/g, ''), 300);
+        const msg = failMessage([e[1].replace(/^['"]|['"]$/g, '')], hidden);
+        if (t && !t.message && msg) t.message = msg;
         lastTapFail = null;
       }
     }
@@ -279,6 +342,7 @@ export function parseTestOutput(raw, hidden = false) {
       else if (line.trim() && /^\s{2,}/.test(line)) failLines.push(line.trim());
     }
   }
+  flushTapBlock();
   flushFail();
   return order.map((n) => byName.get(n));
 }
@@ -514,7 +578,9 @@ export function fitManifest(m, maxBytes = SEND_MAX_BYTES) {
   return m;
 }
 
-export function assembleManifest(parts) {
+export function assembleManifest(rawParts) {
+  // NUL(\u0000)은 서버 DB 가 거부해서 제출 저장이 매번 실패한다. 비밀 가리기보다 먼저, 모든 글에서 지운다
+  const parts = stripNul(rawParts || {});
   const diffBuf = Buffer.from(parts.diff || '', 'utf8');
   const diffTooLong = diffBuf.length > DIFF_MAX_BYTES;
   const diff = diffTooLong ? diffBuf.subarray(0, DIFF_MAX_BYTES).toString('utf8').replace(/�+$/, '') : parts.diff || '';

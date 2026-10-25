@@ -15,8 +15,9 @@
   },
   // practice CLI 와 Codex 를 설치하고, 셸 기록이 바로 파일에 남게 한다
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-  // 작업 공간이 멈췄다 다시 켜지면 뒤에서 도는 지켜보는 프로그램이 사라진다. 켜질 때마다 status 를 한 번 불러 다시 켠다(시작 전이면 아무 일도 안 한다)
-  "postStartCommand": "timeout 25 practice status >/dev/null 2>&1 || true",
+  // 작업 공간이 멈췄다 다시 켜지면 뒤에서 도는 지켜보는 프로그램이 사라진다. 켜질 때마다 status 를 한 번 불러 다시 켠다(시작 전이면 아무 일도 안 한다).
+  // status 는 지켜보는 프로그램을 먼저 켠 뒤에 서버 상태를 묻는다. 서버가 느려 45초에 끊겨도 되살리기는 이미 끝나 있다
+  "postStartCommand": "timeout 45 practice status >/dev/null 2>&1 || true",
   "forwardPorts": [3000, 5173, 8000, 8080],
   "portsAttributes": {
     "3000": { "label": "미리보기 3000", "onAutoForward": "notify" },

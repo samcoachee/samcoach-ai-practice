@@ -242,6 +242,47 @@ function readTextSafe(file) {
   }
 }
 
+/**
+ * 세션 파일 해석 결과 캐시. watch 는 30초마다 사용량을 다시 세는데, 225분 과제에서 세션 파일이 수십 MB 로 커지면
+ * 파일 전체를 읽고 줄마다 JSON.parse 하는 일이 매번 반복돼 CPU 가 낭비된다(10/25 2차 검토).
+ * 파일 경로 · 수정 시각 · 크기가 같으면 지난번 결과를 그대로 쓴다. 이어 쓰는 파일은 크기가 늘어 바로 다시 읽힌다.
+ * 해석 결과는 읽기만 하고 고치지 않으므로 같은 객체를 돌려 써도 안전하다.
+ */
+const parseCache = new Map();
+const CACHE_MAX = 300;
+/** 시험이 캐시를 썼는지 보는 용도 */
+export const sessionCacheStats = { parsed: 0, reused: 0 };
+
+export function clearSessionCache() {
+  parseCache.clear();
+  sessionCacheStats.parsed = 0;
+  sessionCacheStats.reused = 0;
+}
+
+function parseFileCached(kind, file, sinceMs, parse) {
+  let st = null;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    st = null;
+  }
+  const key = `${kind}\u0001${file}\u0001${sinceMs}`;
+  if (st) {
+    const hit = parseCache.get(key);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+      sessionCacheStats.reused += 1;
+      return hit.value;
+    }
+  }
+  const value = parse(readTextSafe(file), sinceMs);
+  sessionCacheStats.parsed += 1;
+  if (st) {
+    if (parseCache.size >= CACHE_MAX) parseCache.clear();
+    parseCache.set(key, { mtimeMs: st.mtimeMs, size: st.size, value });
+  }
+  return value;
+}
+
 /** 모델마다 한 줄. 프롬프트 수는 토큰이 가장 큰 줄에 모은다. 아무것도 못 읽으면 0 한 줄 */
 function toUsageRows(tool, byModel, promptCount) {
   const rows = [...byModel.entries()].map(([model, v]) => ({
@@ -273,7 +314,7 @@ export function collectSessions(opts = {}) {
   const codexModels = new Map();
   let codexPrompts = 0;
   for (const file of findSessionFiles('codex', opts)) {
-    const r = parseCodexSession(readTextSafe(file), sinceMs);
+    const r = parseFileCached('codex', file, sinceMs, parseCodexSession);
     for (const [model, v] of r.models) {
       const slot = codexModels.get(model) || { input: 0, cached: 0, output: 0 };
       slot.input += v.input;
@@ -290,7 +331,7 @@ export function collectSessions(opts = {}) {
   const seenPrompt = new Set();
   let claudePrompts = 0;
   for (const file of findSessionFiles('claude', opts)) {
-    const r = parseClaudeSession(readTextSafe(file), sinceMs);
+    const r = parseFileCached('claude', file, sinceMs, parseClaudeSession);
     for (const [id, m] of r.messages) {
       const old = claudeMsgs.get(id);
       if (!old || m.output >= old.output) claudeMsgs.set(id, m);
