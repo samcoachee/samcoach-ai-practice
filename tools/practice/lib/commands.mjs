@@ -33,6 +33,7 @@ import {
   shellHistoryMark,
 } from './manifest.mjs';
 import { collectSessions } from './sessions.mjs';
+import { sysSnapshot } from './sys.mjs';
 import { CLI_VERSION, HEARTBEAT_MS, fmtDuration, fmtTokens, safeJoin, sleep } from './util.mjs';
 
 const TERMINAL_STATUS = new Set(['submitted', 'verifying', 'graded', 'expired']);
@@ -262,7 +263,10 @@ export async function login(ctx, args = []) {
     // 서버에서는 이미 시작됐는데 이 PC 설정에는 시작 기록이 없다 - 작업 공간을 다시 만든 뒤 같은 코드로 로그인한 경우
     ctx.log('이미 시작된 응시입니다. practice start 를 실행하면 하던 작업을 이어서 받습니다. 시간은 처음 시작한 때부터 흐르고 있고, 새로 시작되지 않습니다.');
   } else {
-    ctx.log('준비가 됐으면 practice start 를 실행하세요. 이 명령을 실행하는 순간부터 시간이 흐릅니다.');
+    // 1.4 부터 지켜보는 프로그램을 로그인 직후 켠다 — 연습실 창의 「과제 시작」을 누르면 이 프로그램이 시작 명령을 대신 돈다(실제 2차의 단추와 같은 자리)
+    const w = ensureWatch(ctx);
+    ctx.log(w.pid ? '연습실 창에서 "과제 시작"을 누르면 이 작업 공간이 과제를 받고 시간이 흐르기 시작합니다.' : '준비가 됐으면 practice start 를 실행하세요. 이 명령을 실행하는 순간부터 시간이 흐릅니다.');
+    if (w.pid) ctx.log('터미널에서 practice start 를 실행해도 같습니다. 어느 쪽이든 그 순간부터 시간이 흐릅니다.');
   }
   return cfg;
 }
@@ -430,8 +434,8 @@ const GIVE_UP_AFTER_DEADLINE_MS = 2 * 60 * 60 * 1000;
 
 export async function watch(ctx, args = [], opts = {}) {
   let cfg = readConfig(homeOpts(ctx));
-  if (!cfg.token || !cfg.startedAt) {
-    ctx.warn('아직 시작한 과제가 없습니다. practice login 과 practice start 를 먼저 실행해 주세요.');
+  if (!cfg.token) {
+    ctx.warn('아직 연결한 과제가 없습니다. practice login 을 먼저 실행해 주세요.');
     return { ticks: 0, submitted: false };
   }
   const other = watchPid(ctx);
@@ -449,11 +453,15 @@ export async function watch(ctx, args = [], opts = {}) {
   let submitted = false;
   ctx.log(`지켜보는 프로그램(practice watch)을 시작합니다 (${Math.round(interval / 1000)}초마다).`);
   let rejected = 0;
+  let cpuPrev = null;
+  let startFail = '';
 
   try {
     while (ticks < maxTicks) {
       ticks += 1;
       cfg = readConfig(homeOpts(ctx));
+      // 시작 전에도 돈다(1.4) — 사용량은 보내지 않고 연결 표시와 「과제 시작」 요청만 본다
+      const preStart = !cfg.startedAt;
       const since = parseTime(cfg.startedAt) || 0;
       // 마감 뒤 2시간이 지나면 서버가 접속 코드를 거둔다. 그때까지 제출이 안 됐으면 더 돌아도 할 수 있는 일이 없다
       const due = parseTime(cfg.deadlineAt);
@@ -463,8 +471,17 @@ export async function watch(ctx, args = [], opts = {}) {
       }
       let res = null;
       try {
-        const { usage } = collectSessions({ ...homeOpts(ctx), sinceMs: since });
-        res = await request(ctx, cfg, 'POST', '/cli/heartbeat', { usage }, { retries: 1 });
+        const usage = preStart ? [] : collectSessions({ ...homeOpts(ctx), sinceMs: since }).usage;
+        // CPU · 메모리를 읽다 실패해도 하트비트를 막지 않는다
+        let sys;
+        try {
+          const s = (ctx.sysSnapshot || sysSnapshot)(cpuPrev);
+          cpuPrev = s.cur;
+          sys = s.sys;
+        } catch {
+          sys = undefined;
+        }
+        res = await request(ctx, cfg, 'POST', '/cli/heartbeat', { usage, ...(sys ? { sys } : {}) }, { retries: 1 });
         updateConfig(
           { deadlineAt: res.deadlineAt || cfg.deadlineAt, status: res.status || cfg.status, lastHeartbeatAt: new Date(ctx.now()).toISOString() },
           homeOpts(ctx),
@@ -482,6 +499,19 @@ export async function watch(ctx, args = [], opts = {}) {
         if (rejected >= REJECT_LIMIT) {
           ctx.warn('서버가 접속 코드를 계속 받아 주지 않아 지켜보는 프로그램(practice watch)을 마칩니다. 연습실 창에서 새 코드를 받았다면 practice login 새 코드 를 다시 실행하세요.');
           break;
+        }
+      }
+
+      // 연습실 창에서 「과제 시작」을 눌렀다 — practice start 와 같은 순서를 여기서 돈다. 실패하면 다음 확인 때 다시 하고, 같은 안내는 한 번만 남긴다
+      if (res && preStart && res.startRequested && !readConfig(homeOpts(ctx)).startedAt) {
+        ctx.log('연습실 창에서 과제 시작을 눌렀습니다. 과제를 받습니다.');
+        try {
+          await start(ctx, []);
+          startFail = '';
+        } catch (e) {
+          const msg = e && e.message ? e.message : String(e);
+          if (msg !== startFail) ctx.warn(`과제를 받지 못했습니다. 다음 확인 때 다시 시도합니다. 터미널에서 practice start 를 직접 실행해도 됩니다. (${msg})`);
+          startFail = msg;
         }
       }
 
@@ -786,7 +816,10 @@ export async function status(ctx) {
   ctx.log(`과제: ${cfg.task && cfg.task.title ? cfg.task.title : '(이름 없음)'}`);
   ctx.log(`서버: ${resolveServer(cfg, ctx)}`);
   if (!cfg.startedAt) {
-    ctx.log('상태: 아직 시작 전입니다. practice start 를 실행하면 시간이 흐릅니다.');
+    // 시작 전에도 지켜보는 프로그램이 있어야 연습실 창의 「과제 시작」이 통한다. 작업 공간이 멈췄다 켜지면 여기서 되살린다
+    const pre = TERMINAL_STATUS.has(String(cfg.status)) ? null : ensureWatch(ctx);
+    if (pre && pre.started) ctx.log('지켜보는 프로그램(practice watch)을 다시 켰습니다.');
+    ctx.log('상태: 아직 시작 전입니다. 연습실 창의 "과제 시작"을 누르거나 practice start 를 실행하면 시간이 흐릅니다.');
     return { connected: true, started: false };
   }
 
