@@ -13,7 +13,7 @@ const HELP = `practice ${CLI_VERSION}, AI 업무 과제 연습실
   practice submit --yes        확인하지 않고 바로 제출합니다
   practice submit --again      이미 낸 뒤 확인 문제를 시작하기 전에, 고친 내용을 다시 올립니다
   practice status              남은 시간과 연결 상태, AI 사용량을 봅니다. 꺼진 지켜보는 프로그램도 다시 켭니다
-  practice watch               사용량을 보내고 제출 요청을 기다립니다 (start 가 뒤에서 켭니다)
+  practice watch               연습실 창의 과제 시작과 제출 요청을 기다리고 사용량을 보냅니다 (login 과 start 가 뒤에서 켭니다)
 
 서버 주소를 바꾸려면 환경 변수 PRACTICE_SERVER 를 씁니다.`;
 

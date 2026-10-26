@@ -126,6 +126,17 @@ export function resolveWorkspace(ctx, cfg) {
   return null;
 }
 
+/**
+ * 시작 전(login · status)에 작업 공간을 정한다. 지금 위치(환경 변수 · 현재 폴더)가 먼저다 —
+ * 설정값을 먼저 보면 다른 작업 공간 폴더에서 다시 login 해도 옛 폴더가 고정된다(10/27 2차 검토).
+ * 지금 위치에서 못 찾았을 때만 설정에 적어 둔 폴더(아직 있을 때)를 쓴다. 둘 다 없으면 null.
+ */
+function findWorkspaceBeforeStart(ctx, cfg) {
+  const here = resolveWorkspace(ctx, { ...cfg, workspace: null });
+  if (here) return here;
+  return cfg && cfg.workspace && fs.existsSync(cfg.workspace) ? cfg.workspace : null;
+}
+
 export const assignmentOf = (workspace) => path.join(workspace, 'assignment');
 
 /* ───────────────────────── 뒤에서 도는 watch ───────────────────────── */
@@ -263,17 +274,42 @@ export async function login(ctx, args = []) {
     // 서버에서는 이미 시작됐는데 이 PC 설정에는 시작 기록이 없다 - 작업 공간을 다시 만든 뒤 같은 코드로 로그인한 경우
     ctx.log('이미 시작된 응시입니다. practice start 를 실행하면 하던 작업을 이어서 받습니다. 시간은 처음 시작한 때부터 흐르고 있고, 새로 시작되지 않습니다.');
   } else {
-    // 1.4 부터 지켜보는 프로그램을 로그인 직후 켠다 — 연습실 창의 「과제 시작」을 누르면 이 프로그램이 시작 명령을 대신 돈다(실제 2차의 단추와 같은 자리)
+    // 1.4 부터 지켜보는 프로그램을 로그인 직후 켠다 — 연습실 창의 「과제 시작」을 누르면 이 프로그램이 시작 명령을 대신 돈다(실제 2차의 단추와 같은 자리).
+    // 작업 공간 폴더를 지금 찾아 적어 둔다. 지켜보는 프로그램이 어느 폴더에서 켜졌든 과제를 그 작업 공간에 받게(10/27 검토 — 홈에서 login 하면 단추가 영영 안 통했다)
+    const workspace = findWorkspaceBeforeStart(ctx, cfg);
+    if (!workspace) {
+      ctx.log(`${NO_WORKSPACE_TEXT} 그 폴더에서 practice login 을 다시 실행하면 연습실 창의 "과제 시작" 단추가 통합니다.`);
+      return cfg;
+    }
+    const saved = updateConfig({ workspace }, homeOpts(ctx));
     const w = ensureWatch(ctx);
     ctx.log(w.pid ? '연습실 창에서 "과제 시작"을 누르면 이 작업 공간이 과제를 받고 시간이 흐르기 시작합니다.' : '준비가 됐으면 practice start 를 실행하세요. 이 명령을 실행하는 순간부터 시간이 흐릅니다.');
     if (w.pid) ctx.log('터미널에서 practice start 를 실행해도 같습니다. 어느 쪽이든 그 순간부터 시간이 흐릅니다.');
+    return saved;
   }
   return cfg;
 }
 
 /* ───────────────────────── start ───────────────────────── */
 
-export async function start(ctx, args = []) {
+const startLockPath = (ctx) => path.join(practiceHome(homeOpts(ctx)), 'start.lock');
+const START_BUSY_TEXT = '다른 곳에서 과제를 받는 중입니다(연습실 창의 과제 시작이나 다른 터미널). 잠시 뒤 practice status 로 확인해 주세요.';
+
+/**
+ * 시작은 한 번에 하나만 — 1.4 부터 연습실 창의 「과제 시작」을 본 지켜보는 프로그램과 터미널의 practice start 가 거의 같이 돌 수 있다.
+ * 겹치면 과제 파일 쓰기와 git 기준점이 두 번 생겼다(10/27 검토 재현). 잡은 프로그램이 죽었으면 그 잠금은 버린다.
+ * opts.fromWatch: 지켜보는 프로그램 안에서 부를 때 — 자기 자신을 다시 켜지 않는다.
+ */
+export async function start(ctx, args = [], opts = {}) {
+  const lock = acquireLock(ctx, startLockPath(ctx), START_BUSY_TEXT);
+  try {
+    return await startUnlocked(ctx, args, opts);
+  } finally {
+    releaseLock(lock);
+  }
+}
+
+async function startUnlocked(ctx, args, opts) {
   const force = args.includes('--force');
   let cfg = readConfig(homeOpts(ctx));
   if (!cfg.token || !cfg.sessionId) throw new PracticeError('먼저 연습실 창에서 접속 코드를 받아 practice login <코드> 를 실행해 주세요.');
@@ -326,6 +362,15 @@ export async function start(ctx, args = []) {
 
   // 3) 과제 파일 받기 + git 기준점 (이미 했으면 건너뛴다. 받다가 끊겼으면 practice start 로 다시 받는다)
   if (!cfg.baseline) {
+    // 시계를 켠 뒤 과제 받기가 끊겨서 다시 도는 경우(startedAt 은 있고 baseline 이 없음)에도, assignment 가 이 응시의 폴더이면 손님이 고친 파일을 원본으로 덮지 않는다.
+    // 위 1) 은 startedAt 이 없을 때만 돌아서, 다른 작업 공간에서 이어 받던 응시가 여기서 끊기면 다시 받을 때 이 판정을 놓쳤다(10/27 2차 검토).
+    if (!resume && !force && fs.existsSync(path.join(dir, '.git'))) {
+      const sameRun = (await readRepoSession(dir)) === cfg.sessionId && Boolean(await repoBaseline(dir));
+      if (sameRun) {
+        resume = true;
+        ctx.log('  assignment 폴더에 이 응시의 작업이 있습니다. 그대로 두고 이어서 진행합니다.');
+      }
+    }
     ctx.log(resume ? '과제 정보를 받고 있습니다.' : '과제 파일을 받고 있습니다.');
     const task = await request(ctx, cfg, 'GET', '/cli/task');
     const files = Array.isArray(task.files) ? task.files : [];
@@ -359,8 +404,8 @@ export async function start(ctx, args = []) {
     cfg = updateConfig({ workspace }, homeOpts(ctx));
   }
 
-  // 4) 사용량과 제출 요청을 지켜보는 프로그램
-  const w = ensureWatch(ctx);
+  // 4) 사용량과 제출 요청을 지켜보는 프로그램(지켜보는 프로그램 안에서 불렸으면 자기 자신이라 다시 켜지 않는다)
+  const w = opts.fromWatch ? { started: false, pid: process.pid } : ensureWatch(ctx);
   ctx.log(w.started ? '  지켜보는 프로그램(practice watch)을 뒤에서 켰습니다. 사용량을 보내고 제출 요청을 기다립니다.' : '  지켜보는 프로그램(practice watch)이 이미 켜져 있습니다.');
 
   const deadline = parseTime(cfg.deadlineAt);
@@ -432,6 +477,7 @@ export const REJECT_LIMIT = 3;
 /** 마감이 지나고 이 시간이 지나면 서버도 접속 코드를 거둔다(AXP_LIMITS.codeTtlAfterDeadlineMs) */
 const GIVE_UP_AFTER_DEADLINE_MS = 2 * 60 * 60 * 1000;
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- 명령 호출 모양(ctx, args, opts)을 다른 명령과 맞춘다
 export async function watch(ctx, args = [], opts = {}) {
   let cfg = readConfig(homeOpts(ctx));
   if (!cfg.token) {
@@ -455,6 +501,7 @@ export async function watch(ctx, args = [], opts = {}) {
   let rejected = 0;
   let cpuPrev = null;
   let startFail = '';
+  let startNote = '';
 
   try {
     while (ticks < maxTicks) {
@@ -502,16 +549,24 @@ export async function watch(ctx, args = [], opts = {}) {
         }
       }
 
-      // 연습실 창에서 「과제 시작」을 눌렀다 — practice start 와 같은 순서를 여기서 돈다. 실패하면 다음 확인 때 다시 하고, 같은 안내는 한 번만 남긴다
-      if (res && preStart && res.startRequested && !readConfig(homeOpts(ctx)).startedAt) {
-        ctx.log('연습실 창에서 과제 시작을 눌렀습니다. 과제를 받습니다.');
+      // 연습실 창에서 「과제 시작」을 눌렀다 — practice start 와 같은 순서를 여기서 돈다.
+      // 시계는 켰는데 과제 파일 받기가 끊긴 경우(startedAt 은 있고 baseline 이 없음)도 다음 확인 때 이어 받는다(10/27 검토 — 예전에는 다시 하지 않았다).
+      // 같은 요청 · 같은 실패의 안내는 한 번만 남기고, 터미널의 practice start 가 받는 중(잠금)이면 조용히 다음 확인을 기다린다.
+      const now = readConfig(homeOpts(ctx));
+      const wantStart = res && ((preStart && res.startRequested && !now.startedAt) || (now.startedAt && !now.baseline && res.status === 'started'));
+      if (wantStart) {
+        const note = now.startedAt ? '과제 파일을 아직 받지 못해 다시 받습니다.' : '연습실 창에서 과제 시작을 눌렀습니다. 과제를 받습니다.';
+        if (note !== startNote) ctx.log(note);
+        startNote = note;
         try {
-          await start(ctx, []);
+          await start(ctx, [], { fromWatch: true });
           startFail = '';
+          startNote = '';
         } catch (e) {
+          const locked = Boolean(e && e.body && e.body.code === 'LOCKED');
           const msg = e && e.message ? e.message : String(e);
-          if (msg !== startFail) ctx.warn(`과제를 받지 못했습니다. 다음 확인 때 다시 시도합니다. 터미널에서 practice start 를 직접 실행해도 됩니다. (${msg})`);
-          startFail = msg;
+          if (!locked && msg !== startFail) ctx.warn(`과제를 받지 못했습니다. 다음 확인 때 다시 시도합니다. 터미널에서 practice start 를 직접 실행해도 됩니다. (${msg})`);
+          if (!locked) startFail = msg;
         }
       }
 
@@ -554,9 +609,11 @@ const hiddenMarkPath = (ctx) => path.join(practiceHome(homeOpts(ctx)), 'hidden-w
  * 제출은 한 번에 하나만 — 터미널의 practice submit 과 뒤에서 도는 watch 의 자동 제출이 겹치면
  * 숨은 테스트 파일을 서로 덮어써 남기거나 결과를 덮었다(10/25 검토). 잡은 프로그램이 죽었으면 그 잠금은 버린다.
  */
-function acquireLock(ctx) {
+const SUBMIT_BUSY_TEXT =
+  '다른 제출이 진행 중입니다. 연습실 창에서 요청한 제출이 뒤에서 돌고 있을 수 있습니다. 끝나면 연습실 창이 제출 확인 화면으로 바뀝니다. 진행은 tail -n 20 ~/.practice/watch.log 로 볼 수 있습니다.';
+
+function acquireLock(ctx, p = lockPath(ctx), busyText = SUBMIT_BUSY_TEXT) {
   fs.mkdirSync(practiceHome(homeOpts(ctx)), { recursive: true });
-  const p = lockPath(ctx);
   for (let i = 0; i < 2; i++) {
     try {
       const fd = fs.openSync(p, 'wx');
@@ -567,10 +624,7 @@ function acquireLock(ctx) {
       if (!e || e.code !== 'EEXIST') throw e;
       const holder = readPidRecord(p);
       if (holder && holder.pid !== process.pid && recordAlive(holder)) {
-        throw new PracticeError(
-          '다른 제출이 진행 중입니다. 연습실 창에서 요청한 제출이 뒤에서 돌고 있을 수 있습니다. 끝나면 연습실 창이 제출 확인 화면으로 바뀝니다. 진행은 tail -n 20 ~/.practice/watch.log 로 볼 수 있습니다.',
-          { status: 423, body: { code: 'LOCKED' } },
-        );
+        throw new PracticeError(busyText, { status: 423, body: { code: 'LOCKED' } });
       }
       try {
         fs.unlinkSync(p);
@@ -817,7 +871,17 @@ export async function status(ctx) {
   ctx.log(`서버: ${resolveServer(cfg, ctx)}`);
   if (!cfg.startedAt) {
     // 시작 전에도 지켜보는 프로그램이 있어야 연습실 창의 「과제 시작」이 통한다. 작업 공간이 멈췄다 켜지면 여기서 되살린다
-    const pre = TERMINAL_STATUS.has(String(cfg.status)) ? null : ensureWatch(ctx);
+    // login 과 같은 규칙 — 작업 공간을 찾을 때만 켠다. 못 찾고 켜면 연습실 창의 「과제 시작」이 열리는데 눌러도 NO_WORKSPACE 로 실패한다(10/27 2차 검토)
+    let pre = null;
+    if (!TERMINAL_STATUS.has(String(cfg.status))) {
+      const workspace = findWorkspaceBeforeStart(ctx, cfg);
+      if (workspace) {
+        if (workspace !== cfg.workspace) cfg = updateConfig({ workspace }, homeOpts(ctx));
+        pre = ensureWatch(ctx);
+      } else {
+        ctx.log(`${NO_WORKSPACE_TEXT} 그 폴더에서 practice login 을 다시 실행하면 연습실 창의 "과제 시작" 단추가 통합니다.`);
+      }
+    }
     if (pre && pre.started) ctx.log('지켜보는 프로그램(practice watch)을 다시 켰습니다.');
     ctx.log('상태: 아직 시작 전입니다. 연습실 창의 "과제 시작"을 누르거나 practice start 를 실행하면 시간이 흐릅니다.');
     return { connected: true, started: false };
