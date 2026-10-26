@@ -442,14 +442,20 @@ function listNames(dir, label, max = 100) {
   }
 }
 
+// Codex 는 사용자 Skill 을 ~/.agents/skills(예전 자리 ~/.codex/skills)에서, 저장소 Skill 을 .agents/skills 에서 읽는다.
+// .claude 자리는 예전 작업 공간에서 만든 것을 놓치지 않으려고 남겨 둔다
 export function readSkills({ assignmentDir, workspaceDir, ...homeOpts }) {
   const homes = toolHomes(homeOpts);
+  const home = homeOpts.home || os.homedir();
   const out = [
-    ...listNames(path.join(homes.claude, 'skills'), '~/.claude/skills'),
+    ...listNames(path.join(home, '.agents', 'skills'), '~/.agents/skills'),
     ...listNames(path.join(homes.codex, 'skills'), '~/.codex/skills'),
+    ...listNames(path.join(homes.claude, 'skills'), '~/.claude/skills'),
+    ...listNames(path.join(assignmentDir, '.agents', 'skills'), 'assignment/.agents/skills'),
     ...listNames(path.join(assignmentDir, '.claude', 'skills'), 'assignment/.claude/skills'),
   ];
   if (workspaceDir && path.resolve(workspaceDir) !== path.resolve(assignmentDir)) {
+    out.push(...listNames(path.join(workspaceDir, '.agents', 'skills'), '.agents/skills'));
     out.push(...listNames(path.join(workspaceDir, '.claude', 'skills'), '.claude/skills'));
   }
   return out.slice(0, 200);

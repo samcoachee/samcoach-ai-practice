@@ -364,12 +364,12 @@ export async function start(ctx, args = []) {
   ctx.log('');
   // 과제 파일은 모두 assignment 폴더에 풀린다. 루트에서 npm 이나 codex 를 쓰면 package.json 이 없고, 결과물도 제출 폴더 밖에 만들어진다
   if (inAssignment(ctx, dir)) {
-    ctx.log('지금 터미널이 assignment 폴더 안이라 바로 codex 나 claude 를 실행하면 됩니다.');
+    ctx.log('지금 터미널이 assignment 폴더 안이라 바로 codex 를 실행하면 됩니다.');
   } else {
-    ctx.log('작업은 assignment 폴더 안에서 합니다. 먼저 cd assignment 를 한 번 실행하고, 그 폴더에서 codex 나 claude 를 실행하세요.');
+    ctx.log('작업은 assignment 폴더 안에서 합니다. 먼저 cd assignment 를 한 번 실행하고, 그 폴더에서 codex 를 실행하세요.');
   }
-  ctx.log('assignment/README.md 부터 읽어 보세요. 일을 맡긴 담당자에게는 연습실 창 오른쪽 대화에서 물어볼 수 있습니다.');
-  ctx.log('다 끝났으면 연습실 창의 "제출하고 확인 문제로"를 누르세요. 직접 내려면 practice submit 입니다.');
+  ctx.log('assignment/README.md 부터 읽어 보세요. 일을 맡긴 업무 담당자에게는 연습실 창 오른쪽 대화에서 물어볼 수 있습니다.');
+  ctx.log('다 끝났으면 연습실 창의 "제출하고 문제풀기"를 누르세요. 직접 내려면 practice submit 입니다.');
   return cfg;
 }
 
@@ -732,7 +732,7 @@ export async function submit(ctx, args = [], opts = {}) {
     say('파일과 결과물을 읽습니다');
     const files = listFiles(dir);
     const deliverables = readDeliverables(dir, cfg.deliverables || []);
-    say('AI 사용 기록(Codex와 Claude Code)을 읽습니다');
+    say('AI 사용 기록을 읽습니다');
     const { usage, prompts } = collectSessions({ ...homeOpts(ctx), sinceMs: since });
     const skills = readSkills({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
     const mcp = readMcp({ assignmentDir: dir, workspaceDir: workspace, ...homeOpts(ctx) });
@@ -818,6 +818,9 @@ export async function status(ctx) {
     const label = u.tool === 'codex' ? 'Codex' : 'Claude Code';
     ctx.log(`${label}: 입력 ${fmtTokens(u.inputTokens)}, 출력 ${fmtTokens(u.outputTokens)}, 캐시 ${fmtTokens(u.cachedTokens)} 토큰, 보낸 요청 ${u.prompts}개${u.model ? ` (${u.model})` : ''}`);
   }
+  // 실제 2차는 제공된 Codex만 쓴다. 기록은 그대로 보내고(점수는 깎지 않는다) 여기서만 알린다
+  // 안 쓴 도구도 0 으로 된 줄이 오니 요청 수나 토큰이 있을 때만 쓴 것으로 본다
+  if (usage.some((u) => u.tool === 'claude' && (u.prompts > 0 || u.inputTokens + u.outputTokens > 0))) ctx.log('Claude Code를 쓴 기록이 있습니다. 실제 2차에서는 제공된 Codex만 쓸 수 있습니다.');
 
   if (st === 'expired') ctx.log(EXPIRED_TEXT);
   if (codeExpired && !cfg.submittedAt && !TERMINAL_STATUS.has(String(st))) {

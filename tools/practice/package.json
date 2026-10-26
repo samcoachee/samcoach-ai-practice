@@ -1,6 +1,6 @@
 {
   "name": "practice-cli",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "AI 업무 과제 연습실 작업 공간용 명령줄 도구. 외부 패키지 없이 Node 22 내장 기능만 쓴다.",
   "private": true,
   "type": "module",

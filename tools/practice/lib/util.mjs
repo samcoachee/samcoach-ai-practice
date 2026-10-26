@@ -2,7 +2,7 @@
 import path from 'node:path';
 
 // 서버(AXP_MIN_CLI)보다 낮으면 서버가 409 CLI_OUTDATED 로 막는다. 올릴 때는 package.json 의 version 도 같이 올린다(시험이 맞춰 본다)
-export const CLI_VERSION = '1.2.0';
+export const CLI_VERSION = '1.3.0';
 export const CODE_PREFIX = 'prac_';
 /** 제출 묶음 최대 크기 — 서버(AXP_LIMITS.bundleMaxBytes)와 같은 값 */
 export const BUNDLE_MAX_BYTES = 20 * 1024 * 1024;

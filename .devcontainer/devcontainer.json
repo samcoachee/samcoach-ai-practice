@@ -3,8 +3,7 @@
   "name": "AI 업무 과제 연습실",
   "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
   "features": {
-    "ghcr.io/devcontainers/features/python:1": {},
-    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+    "ghcr.io/devcontainers/features/python:1": {}
   },
   "hostRequirements": {
     "cpus": 2
@@ -19,11 +18,12 @@
   // status 는 지켜보는 프로그램을 먼저 켠 뒤에 서버 상태를 묻는다. 서버가 느려 45초에 끊겨도 되살리기는 이미 끝나 있다
   "postStartCommand": "timeout 45 practice status >/dev/null 2>&1 || true",
   "forwardPorts": [3000, 5173, 8000, 8080],
+  // 실제 2차는 IDE 안의 Browser 도구로 띄운 서버를 본다. 여기서는 VS Code 안 미리보기 창이 그 자리다
   "portsAttributes": {
-    "3000": { "label": "미리보기 3000", "onAutoForward": "notify" },
+    "3000": { "label": "미리보기 3000", "onAutoForward": "openPreview" },
     "5173": { "label": "미리보기 5173", "onAutoForward": "openPreview" },
-    "8000": { "label": "미리보기 8000", "onAutoForward": "notify" },
-    "8080": { "label": "미리보기 8080", "onAutoForward": "notify" }
+    "8000": { "label": "미리보기 8000", "onAutoForward": "openPreview" },
+    "8080": { "label": "미리보기 8080", "onAutoForward": "openPreview" }
   },
   "customizations": {
     "codespaces": {
