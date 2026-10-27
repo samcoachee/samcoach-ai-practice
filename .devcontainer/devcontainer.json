@@ -46,7 +46,9 @@
         "search.useIgnoreFiles": false,
         "terminal.integrated.fontSize": 14,
         "explorer.confirmDelete": false,
-        "telemetry.telemetryLevel": "off"
+        "telemetry.telemetryLevel": "off",
+        // VS Code 에 들어 있는 Copilot 안내(GitHub 로그인 · AI 기능)를 숨긴다. 2차는 Codex 만 쓰는데, 10/27 손님이 이 안내를 보고 AI 를 못 쓴다고 문의했다
+        "chat.disableAIFeatures": true
       }
     }
   }
